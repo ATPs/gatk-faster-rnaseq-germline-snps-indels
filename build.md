@@ -19,13 +19,27 @@ Current Rust binaries:
 - `rust_apply_bqsr`
 - `rust_mark_duplicates`
 - `rust_hc_prefilter`
+- `rust_haplotype_caller`
+- `rust_hc_vcf_compare`
+- `rust_hc_select_regions`
+- `rust_hc_run_gatk_oracle`
+- `rust_hc_gatk_debug_extract`
+- `rust_hc_region_replay`
+- `rust_hc_vcf_to_genotype_table`
+- `rust_hc_active_region_diff`
+- `rust_hc_read_finalize_diff`
+- `rust_hc_assembly_diff`
+- `rust_hc_pairhmm_diff`
+- `rust_hc_genotype_diff`
+- `rust_hc_acceptance_report`
 
 ## Environment
 
 Use the same shell environment as normal local runs:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 ```
@@ -43,7 +57,8 @@ Those settings are needed so `rust-htslib` / `hts-sys` bindgen can find the cond
 Standard release build:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/rust
 cargo build --release --bins
@@ -62,7 +77,8 @@ In this environment, the fully static `musl` target is not installed, so this re
 From `src/rust`:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/rust
 RUSTFLAGS='-C target-feature=+crt-static' \
@@ -80,7 +96,8 @@ src/rust/target/x86_64-unknown-linux-gnu/release/
 After a successful static-CRT build, copy the binaries into the location used by the Python pipeline:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_interval_tools src/rust/bin/
@@ -89,12 +106,26 @@ install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_base_recali
 install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_apply_bqsr src/rust/bin/
 install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_mark_duplicates src/rust/bin/
 install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_prefilter src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_haplotype_caller src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_vcf_compare src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_select_regions src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_run_gatk_oracle src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_gatk_debug_extract src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_region_replay src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_vcf_to_genotype_table src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_active_region_diff src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_read_finalize_diff src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_assembly_diff src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_pairhmm_diff src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_genotype_diff src/rust/bin/
+install -m 755 src/rust/target/x86_64-unknown-linux-gnu/release/rust_hc_acceptance_report src/rust/bin/
 ```
 
 Or in one loop:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 for bin in \
@@ -103,10 +134,37 @@ for bin in \
   rust_base_recalibrator \
   rust_apply_bqsr \
   rust_mark_duplicates \
-  rust_hc_prefilter
+  rust_hc_prefilter \
+  rust_haplotype_caller \
+  rust_hc_vcf_compare \
+  rust_hc_select_regions \
+  rust_hc_run_gatk_oracle \
+  rust_hc_gatk_debug_extract \
+  rust_hc_region_replay \
+  rust_hc_vcf_to_genotype_table \
+  rust_hc_active_region_diff \
+  rust_hc_read_finalize_diff \
+  rust_hc_assembly_diff \
+  rust_hc_pairhmm_diff \
+  rust_hc_genotype_diff \
+  rust_hc_acceptance_report
 do
   install -m 755 "src/rust/target/x86_64-unknown-linux-gnu/release/$bin" src/rust/bin/
 done
+```
+
+For the normal dynamically linked release build, install `rust_haplotype_caller` with:
+
+```bash
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
+export PATH=/data/p/bin:$PATH
+export LIBCLANG_PATH=/data/p/anaconda3/lib
+export BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-redhat-linux/11/include -I/usr/include -I/usr/include/x86_64-linux-gnu'
+cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
+cargo build --release --manifest-path src/rust/Cargo.toml --bin rust_haplotype_caller
+install -m 755 src/rust/target/release/rust_haplotype_caller src/rust/bin/rust_haplotype_caller
+src/rust/bin/rust_haplotype_caller --help
 ```
 
 ## Verify the build
@@ -114,7 +172,8 @@ done
 Run tests:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/rust
 cargo test --release --bins
@@ -142,7 +201,8 @@ Expected result:
 Check wrapper and pipeline syntax:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 python -m py_compile src/*.py
@@ -154,7 +214,202 @@ python src/step_apply_bqsr.py --help
 python src/step_mark_duplicates.py --help
 python src/step_split_hc_intervals.py --help
 python src/step_hc_prefilter.py --help
+python src/step_haplotype_caller.py --help
 ```
+
+## HaplotypeCaller matching tools
+
+Module 6 now includes separate Rust tools for Java/Rust HaplotypeCaller matching. They are diagnostic tools, not pipeline defaults.
+
+Build them with the rest of the crate:
+
+```bash
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
+export PATH=/data/p/bin:$PATH
+cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
+cargo build --release --manifest-path src/rust/Cargo.toml --bins
+```
+
+Useful commands:
+
+```bash
+# Reproduce exact allele-key VCF comparison tables.
+src/rust/target/release/rust_hc_vcf_compare \
+  --a-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_gatk_hc_rerun_20260616/SRR949115.gatk_hc_rerun.filtered.vcf.gz \
+  --b-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_rust_hc_current_20260616/SRR949115.rust_hc_current.filtered.vcf.gz \
+  --a-label gatk_rerun \
+  --b-label rust_current \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_vs_rust
+
+# Select focused debug regions from discordant and matching calls.
+src/rust/target/release/rust_hc_select_regions \
+  --a-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_gatk_hc_rerun_20260616/SRR949115.gatk_hc_rerun.filtered.vcf.gz \
+  --b-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_rust_hc_current_20260616/SRR949115.rust_hc_current.filtered.vcf.gz \
+  --interval-list-template /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/reference/exons.interval_list \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/debug_regions
+
+# Run GATK on selected regions with existing hidden debug outputs enabled.
+src/rust/target/release/rust_hc_run_gatk_oracle \
+  --input-bam /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.recal.bam \
+  --ref /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.fasta \
+  --input-interval-list /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/debug_regions.regions.interval_list \
+  --dbsnp /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.dbsnp138.vcf.gz \
+  --output-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle.raw.vcf.gz \
+  --output-dir /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle
+
+# Extract GATK debug logs to comparable TSV tables.
+src/rust/target/release/rust_hc_gatk_debug_extract \
+  --genotyper-debug /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle/gatk_hc_oracle.genotyper.txt \
+  --assembly-state /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle/gatk_hc_oracle.assembly_state.txt \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle/gatk_debug
+
+# Replay the current Rust caller on the same selected regions and emit stage TSVs.
+src/rust/target/release/rust_hc_region_replay \
+  --input-bam /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.recal.bam \
+  --ref /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.fasta \
+  --input-interval-list /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/debug_regions.regions.interval_list \
+  --dbsnp /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.dbsnp138.vcf.gz \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/rust_replay \
+  --threads 40 \
+  --memory-gb 128
+
+# Compare candidate events and final genotype rows with explicit keys.
+src/rust/target/release/rust_hc_assembly_diff \
+  --java /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle/gatk_debug.events.tsv \
+  --rust /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/rust_replay.events.tsv \
+  --key-columns chrom,pos,type,alleles \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/diff_events
+
+# Convert GATK VCF calls to the same genotype TSV schema as Rust replay.
+src/rust/target/release/rust_hc_vcf_to_genotype_table \
+  --input-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle.raw.vcf.gz \
+  --output-tsv /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle.genotypes.tsv
+
+src/rust/target/release/rust_hc_genotype_diff \
+  --java /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/gatk_oracle.genotypes.tsv \
+  --rust /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/rust_replay.genotypes.tsv \
+  --output-prefix /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_tools/diff_genotypes
+```
+
+The stage diff tools accept TSV or flat JSONL files and compare rows by configurable key columns:
+
+- `rust_hc_active_region_diff`
+- `rust_hc_read_finalize_diff`
+- `rust_hc_assembly_diff`
+- `rust_hc_pairhmm_diff`
+- `rust_hc_genotype_diff`
+
+Use `rust_hc_acceptance_report` to concatenate stage summaries and VCF summaries into a single Markdown report.
+
+## HaplotypeCaller replacement benchmark
+
+On June 16, 2026, `rust_haplotype_caller` was installed to [src/rust/bin/rust_haplotype_caller](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/rust/bin/rust_haplotype_caller) and benchmarked on the existing `SRR949115` Broad hg38 baseline files from [development/2026-06-16.baseline-sambamba-benchmark.md](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/development/2026-06-16.baseline-sambamba-benchmark.md).
+
+Inputs:
+
+- BAM: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.recal.bam`
+- intervals: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/reference/exons.interval_list`
+- baseline GATK raw VCF: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.raw.vcf.gz`
+- baseline GATK filtered VCF: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.filtered.vcf.gz`
+
+Rust command timed for the HaplotypeCaller replacement stage only:
+
+```bash
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
+export PATH=/data/p/bin:$PATH
+cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
+/usr/bin/time -v \
+  python src/step_haplotype_caller.py \
+    --backend rust \
+    --rust-bin src/rust/bin/rust_haplotype_caller \
+    --ref /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.fasta \
+    --input-bam /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.recal.bam \
+    --input-interval-list /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/reference/exons.interval_list \
+    --output-vcf /XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/SRR949115.rust_hc.raw.vcf.gz \
+    --dbsnp /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.dbsnp138.vcf.gz \
+    --threads 40 \
+    --memory-gb 128 \
+    --pair-hmm-threads 8 \
+    --pair-hmm-implementation native
+```
+
+Results:
+
+| stage | seconds | minutes | peak RSS | output |
+|---|---:|---:|---:|---|
+| GATK `HaplotypeCaller` baseline | 1425.558 | 23.759 | not recorded in timing TSV | `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/baseline/SRR949115.raw.vcf.gz` |
+| Rust `rust_haplotype_caller call` | 27.978 | 0.466 | 939,360 KB | `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/SRR949115.rust_hc.raw.vcf.gz` |
+
+Stage-only speedup:
+
+- `1425.558 / 27.978 = 50.95x`
+- wall-time reduction: `1397.580 s`
+
+Validation and comparison artifacts:
+
+- timing row: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/timings.tsv`
+- Rust caller log: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/logs/haplotype_caller.log`
+- Rust `/usr/bin/time -v`: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/logs/haplotype_caller.time.txt`
+- filtered Rust VCF for comparison: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/rust_haplotype_caller/SRR949115.rust_hc.filtered.vcf.gz`
+- `bcftools isec`: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/vcf_isec_baseline_rust_hc`
+
+Record counts after running the existing `VariantFiltration` hard filters on the Rust raw VCF:
+
+| VCF | total records | PASS | non-PASS |
+|---|---:|---:|---:|
+| baseline GATK filtered | 41,151 | 36,435 | 4,716 |
+| Rust filtered | 48,951 | 42,248 | 6,703 |
+
+Exact allele-key comparison (`CHROM POS REF ALT`):
+
+| set | baseline | Rust | shared | baseline-private | Rust-private |
+|---|---:|---:|---:|---:|---:|
+| all filtered records | 41,151 | 48,951 | 36,608 | 4,543 | 12,343 |
+| PASS records | 36,435 | 42,248 | 32,719 | 3,716 | 9,529 |
+
+Interpretation for that initial speed-first snapshot:
+
+- The Rust caller is much faster for this stage, but it is not yet a production replacement for GATK `HaplotypeCaller`.
+- PASS sensitivity against the baseline filtered VCF is `89.80%` by exact allele key.
+- Rust-private PASS calls are high (`9,529`), because the current implementation is a speed-first pileup SNP/short-indel caller, not a local-assembly HaplotypeCaller clone.
+- The result is useful as a performance baseline and a development target for improving caller accuracy.
+
+### Same-input GATK rerun audit
+
+After the algorithm audit in [development/2026-06-16.gatk-haplotypecaller-core-algorithm.md](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/development/2026-06-16.gatk-haplotypecaller-core-algorithm.md), Java GATK `HaplotypeCaller` was rerun on the exact same BAM, interval list, reference, and dbSNP used for the Rust comparison.
+
+Output and logs:
+
+- GATK rerun directory: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_gatk_hc_rerun_20260616`
+- current Rust run directory: `/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115_broad_hg38_run2/module6_rust_hc_current_20260616`
+- detailed comparison report: [development/2026-06-16.gatk-hc-rerun-and-rust-current-comparison.md](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/development/2026-06-16.gatk-hc-rerun-and-rust-current-comparison.md)
+
+Timing:
+
+| stage | seconds | minutes |
+|---|---:|---:|
+| GATK rerun `HaplotypeCaller` | 1171.213 | 19.520 |
+| GATK rerun `VariantFiltration` | 4.326 | 0.072 |
+| Rust current `rust_haplotype_caller` | 51.239 | 0.854 |
+| Rust current `VariantFiltration` | 3.907 | 0.065 |
+
+The current Rust caller remains fast: `22.86x` faster than the same-input GATK rerun for the caller stage alone. It is not close enough in output:
+
+| comparison | A count | B count | shared | A private | B private | A sensitivity | B precision vs A |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline filtered vs GATK rerun filtered, all records | 41,151 | 41,151 | 41,151 | 0 | 0 | 100.000% | 100.000% |
+| baseline filtered vs GATK rerun filtered, PASS only | 36,435 | 36,435 | 36,435 | 0 | 0 | 100.000% | 100.000% |
+| GATK rerun filtered vs Rust current filtered, all records | 41,151 | 31,860 | 27,450 | 13,701 | 4,410 | 66.706% | 86.158% |
+| GATK rerun filtered vs Rust current filtered, PASS only | 36,435 | 28,350 | 25,028 | 11,407 | 3,322 | 68.692% | 88.282% |
+
+Current conclusion:
+
+- the existing baseline and same-input GATK rerun are identical, so the mismatch is not from upstream stage drift;
+- the current Rust output is further from GATK than the earlier speed-first snapshot after the latest overlap-correction changes;
+- pileup threshold tuning is not the path to GATK-equivalent output;
+- the Rust caller must implement the HaplotypeCaller core algorithm pieces documented in the algorithm audit before it can be considered a replacement.
 
 ## How the pipeline uses the binaries
 
@@ -184,7 +439,8 @@ If bindgen or `hts-sys` fails during build:
 4. Retry with a clean build:
 
 ```bash
-source /data/p/anaconda3/bin/activate base
+source /data/p/anaconda3/etc/profile.d/conda.sh
+conda activate base
 export PATH=/data/p/bin:$PATH
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/rust
 cargo clean

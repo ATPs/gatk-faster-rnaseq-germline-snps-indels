@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub mod haplotype_caller;
-pub mod hc;
+pub mod hc_tools;
 pub mod interval_tools;
 pub mod split_n_cigar;
 

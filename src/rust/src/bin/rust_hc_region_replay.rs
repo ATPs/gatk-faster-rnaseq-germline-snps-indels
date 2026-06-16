@@ -1,38 +1,17 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
-use gatk_faster_rnaseq_rust::haplotype_caller::{call_variants, HaplotypeCallerConfig};
+use clap::{Parser, ValueEnum};
+use gatk_faster_rnaseq_rust::haplotype_caller::{
+    replay_regions, HaplotypeCallerConfig, HaplotypeReplayConfig,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Rust HaplotypeCaller rewrite workbench")]
+#[command(
+    author,
+    version,
+    about = "Emit Rust HaplotypeCaller stage tables for selected regions"
+)]
 struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Run the pipeline-only Rust HaplotypeCaller replacement.
-    Call(CallArgs),
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum PairHmmImplementationArg {
-    Rust,
-    Native,
-}
-
-impl PairHmmImplementationArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            PairHmmImplementationArg::Rust => "rust",
-            PairHmmImplementationArg::Native => "native",
-        }
-    }
-}
-
-#[derive(Debug, Parser)]
-struct CallArgs {
     #[arg(short = 'I', long)]
     input_bam: PathBuf,
 
@@ -43,7 +22,7 @@ struct CallArgs {
     input_interval_list: PathBuf,
 
     #[arg(short = 'O', long)]
-    output_vcf: PathBuf,
+    output_prefix: PathBuf,
 
     #[arg(long)]
     dbsnp: Option<PathBuf>,
@@ -67,13 +46,29 @@ struct CallArgs {
     pair_hmm_implementation: PairHmmImplementationArg,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum PairHmmImplementationArg {
+    Rust,
+    Native,
+}
+
+impl PairHmmImplementationArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            PairHmmImplementationArg::Rust => "rust",
+            PairHmmImplementationArg::Native => "native",
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    match Args::parse().command {
-        Command::Call(args) => call_variants(&HaplotypeCallerConfig {
+    let args = Args::parse();
+    let stats = replay_regions(&HaplotypeReplayConfig {
+        caller: HaplotypeCallerConfig {
             input_bam: args.input_bam,
             reference: args.reference,
             input_interval_list: args.input_interval_list,
-            output_vcf: args.output_vcf,
+            output_vcf: PathBuf::from("/dev/null"),
             dbsnp: args.dbsnp,
             dont_use_soft_clipped_bases: args.dont_use_soft_clipped_bases,
             standard_min_confidence_threshold_for_calling: args
@@ -82,6 +77,16 @@ fn main() -> Result<()> {
             memory_gb: args.memory_gb,
             native_pair_hmm_threads: args.native_pair_hmm_threads,
             pair_hmm_implementation: args.pair_hmm_implementation.as_str().to_string(),
-        }),
-    }
+        },
+        output_prefix: args.output_prefix,
+    })?;
+    println!(
+        "active_regions={} active_loci={} read_observations={} candidate_events={} genotype_rows={}",
+        stats.active_regions,
+        stats.active_loci,
+        stats.read_observations,
+        stats.candidate_events,
+        stats.genotype_rows
+    );
+    Ok(())
 }

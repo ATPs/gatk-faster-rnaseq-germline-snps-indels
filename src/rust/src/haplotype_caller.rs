@@ -3,29 +3,28 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rust_htslib::bam::pileup::Indel;
 use rust_htslib::bam::record::Cigar;
-use rust_htslib::{bam, bam::Read, faidx};
+use rust_htslib::tbx::Read as TbxRead;
+use rust_htslib::{bam, bam::Read, bgzf, faidx, htslib, tbx};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::ptr;
 
-#[derive(Debug, Clone)]
-pub struct ActiveRegionDiscoveryConfig {
-    pub input_bam: PathBuf,
-    pub reference: PathBuf,
-    pub input_interval_list: PathBuf,
-    pub output_active_bed: PathBuf,
-    pub output_summary: PathBuf,
-    pub min_mapq: u8,
-    pub min_baseq: u8,
-    pub min_alt_count: u32,
-    pub min_indel_count: u32,
-    pub min_alt_fraction: f64,
-    pub active_region_padding: u64,
-    pub max_depth: u32,
-    pub threads: usize,
-    pub exclude_supplementary: bool,
-}
+const PIPELINE_MIN_MAPQ: u8 = 20;
+const PIPELINE_MIN_BASEQ: u8 = 10;
+const PIPELINE_MAX_DEPTH: u32 = 100_000;
+const FETCH_WINDOW_GAP: u64 = 1_000;
+const FETCH_WINDOW_MAX_BASES: u64 = 2_000_000;
+const MAX_BOOTSTRAP_INDEL_LEN: u32 = 200;
+const MAX_SAM_QUAL: u8 = 60;
+const DEFAULT_INDEL_QUAL: u8 = 30;
+const HALF_DEFAULT_PCR_SNV_QUAL: u8 = 20;
+const FISHER_STRAND_TARGET_TABLE_SIZE: f64 = 200.0;
+const FISHER_STRAND_MIN_PVALUE: f64 = 1e-320;
+const CALL_PARTITIONS_PER_THREAD: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct HaplotypeCallerConfig {
@@ -42,27 +41,118 @@ pub struct HaplotypeCallerConfig {
     pub pair_hmm_implementation: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub struct ActiveRegionSummary {
-    pub input_intervals: u64,
-    pub input_bases: u64,
-    pub pileup_sites: u64,
-    pub covered_sites: u64,
-    pub active_sites: u64,
-    pub active_regions: u64,
-    pub active_bases: u64,
-    pub max_filtered_depth: u32,
+#[derive(Debug, Clone)]
+pub struct HaplotypeReplayConfig {
+    pub caller: HaplotypeCallerConfig,
+    pub output_prefix: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct HaplotypeReplayStats {
+    pub active_regions: usize,
+    pub active_loci: usize,
+    pub read_observations: usize,
+    pub candidate_events: usize,
+    pub genotype_rows: usize,
 }
 
 pub fn call_variants(config: &HaplotypeCallerConfig) -> Result<()> {
     validate_haplotype_caller_config(config)?;
-    bail!(
-        "rust_haplotype_caller call has a validated CLI surface, but assembly, PairHMM, genotyping, annotations, and VCF writing are not implemented yet. Use discover-active-regions for the current implemented subsystem."
+    let (dict, mut intervals) = read_interval_list(&config.input_interval_list)?;
+    sort_intervals(&mut intervals, &dict)?;
+    let fetch_windows = coalesce_fetch_windows(&intervals);
+    let partitions = partition_fetch_windows_by_bases(
+        &fetch_windows,
+        config
+            .threads
+            .max(1)
+            .saturating_mul(CALL_PARTITIONS_PER_THREAD),
     );
+    let sample_name = sample_name_from_bam(&config.input_bam)?;
+
+    let thread_pool = ThreadPoolBuilder::new()
+        .num_threads(config.threads.max(1))
+        .build()
+        .context("creating HaplotypeCaller call thread pool")?;
+    let worker_outputs: Vec<Result<CallWorkerOutput>> = thread_pool.install(|| {
+        partitions
+            .into_par_iter()
+            .map(|partition| scan_call_partition(config, &partition))
+            .collect()
+    });
+
+    let mut variants = Vec::new();
+    for worker_output in worker_outputs {
+        variants.extend(worker_output?.variants);
+    }
+    sort_variant_calls(&mut variants, &dict)?;
+    dedup_variant_calls(&mut variants);
+    if let Some(dbsnp) = &config.dbsnp {
+        annotate_dbsnp(dbsnp, &mut variants)?;
+    }
+
+    write_bootstrap_vcf(&config.output_vcf, config, &dict, &sample_name, &variants)?;
+    if is_gzip_path(&config.output_vcf) {
+        write_tabix_index(&config.output_vcf, config.threads)?;
+    }
+    Ok(())
+}
+
+pub fn replay_regions(config: &HaplotypeReplayConfig) -> Result<HaplotypeReplayStats> {
+    validate_haplotype_caller_config(&config.caller)?;
+    let (dict, mut intervals) = read_interval_list(&config.caller.input_interval_list)?;
+    sort_intervals(&mut intervals, &dict)?;
+    let fetch_windows = coalesce_fetch_windows(&intervals);
+    let partitions = partition_fetch_windows_by_bases(
+        &fetch_windows,
+        config
+            .caller
+            .threads
+            .max(1)
+            .saturating_mul(CALL_PARTITIONS_PER_THREAD),
+    );
+
+    let thread_pool = ThreadPoolBuilder::new()
+        .num_threads(config.caller.threads.max(1))
+        .build()
+        .context("creating HaplotypeCaller replay thread pool")?;
+    let worker_outputs: Vec<Result<ReplayWorkerOutput>> = thread_pool.install(|| {
+        partitions
+            .into_par_iter()
+            .map(|partition| scan_replay_partition(&config.caller, &partition))
+            .collect()
+    });
+
+    let mut output = ReplayWorkerOutput::default();
+    for worker_output in worker_outputs {
+        output.extend(worker_output?);
+    }
+    sort_replay_rows(&mut output, &dict)?;
+    sort_variant_calls(&mut output.variants, &dict)?;
+    dedup_variant_calls(&mut output.variants);
+    if let Some(dbsnp) = &config.caller.dbsnp {
+        annotate_dbsnp(dbsnp, &mut output.variants)?;
+    }
+
+    let genotype_rows: Vec<ReplayGenotypeRow> = output
+        .variants
+        .iter()
+        .map(ReplayGenotypeRow::from)
+        .collect();
+    let stats = HaplotypeReplayStats {
+        active_regions: output.active_regions.len(),
+        active_loci: output.active_loci.len(),
+        read_observations: output.read_observations.len(),
+        candidate_events: output.events.len(),
+        genotype_rows: genotype_rows.len(),
+    };
+    write_replay_tables(&config.output_prefix, &output, &genotype_rows)?;
+    Ok(stats)
 }
 
 #[derive(Clone, Debug)]
 struct DictRecord {
+    name: String,
     length: u64,
 }
 
@@ -89,98 +179,292 @@ struct Interval {
     end: u64,
 }
 
-impl Interval {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FetchWindow {
+    contig: String,
+    start: u64,
+    end: u64,
+    intervals: Vec<Interval>,
+}
+
+impl FetchWindow {
     fn len(&self) -> u64 {
         self.end - self.start + 1
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-struct SiteEvidence {
+#[derive(Clone, Debug, PartialEq)]
+struct VariantCall {
+    contig: String,
+    pos: u64,
+    id: Option<String>,
+    db: bool,
+    ref_allele: Vec<u8>,
+    alt_allele: Vec<u8>,
     depth: u32,
+    ref_count: u32,
     alt_count: u32,
-    indel_count: u32,
+    qual: u32,
+    fs: f64,
+    pl: [u32; 3],
+    genotype_index: usize,
+}
+
+impl VariantCall {
+    fn genotype(&self) -> &'static str {
+        match self.genotype_index {
+            0 => "0/0",
+            1 => "0/1",
+            2 => "1/1",
+            _ => "0/1",
+        }
+    }
+
+    fn alt_allele_count(&self) -> u32 {
+        match self.genotype_index {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 1,
+        }
+    }
+
+    fn gq(&self) -> u32 {
+        self.pl
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != self.genotype_index)
+            .map(|(_, pl)| *pl)
+            .min()
+            .unwrap_or(0)
+            .min(99)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct BaseCounts {
+    counts: [u32; 4],
+    depth: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct StrandCounts {
+    forward: u32,
+    reverse: u32,
+}
+
+impl StrandCounts {
+    fn increment(&mut self, is_reverse: bool) {
+        if is_reverse {
+            self.reverse += 1;
+        } else {
+            self.forward += 1;
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct BaseObservation {
+    base_index: usize,
+    quality: u8,
+    is_reverse: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SnpEvidence {
+    counts: BaseCounts,
+    strands: [StrandCounts; 4],
+    observations: Vec<BaseObservation>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum IndelAllele {
+    Insertion(Vec<u8>),
+    Deletion(u32),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct IndelCounts {
+    depth: u32,
+    ref_count: u32,
+    counts: HashMap<IndelAllele, u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IndelObservationAllele {
+    Ref,
+    Alt(IndelAllele),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IndelObservation {
+    allele: IndelObservationAllele,
+    quality: u8,
+    is_reverse: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct IndelEvidence {
+    counts: IndelCounts,
+    ref_strand: StrandCounts,
+    alt_strands: HashMap<IndelAllele, StrandCounts>,
+    observations: Vec<IndelObservation>,
+}
+
+#[derive(Clone, Debug)]
+struct VariantModel {
+    qual: u32,
+    pl: [u32; 3],
+    genotype_index: usize,
 }
 
 #[derive(Default)]
-struct WorkerOutput {
-    summary: ActiveRegionSummary,
-    active_regions: Vec<Interval>,
+struct CallWorkerOutput {
+    variants: Vec<VariantCall>,
 }
 
-pub fn discover_active_regions(
-    config: &ActiveRegionDiscoveryConfig,
-) -> Result<ActiveRegionSummary> {
-    validate_active_region_config(config)?;
-    let (dict, intervals) = read_interval_list(&config.input_interval_list)?;
-    let partitions = partition_intervals_by_bases(&intervals, config.threads.max(1));
-
-    let thread_pool = ThreadPoolBuilder::new()
-        .num_threads(config.threads.max(1))
-        .build()
-        .context("creating HaplotypeCaller active-region thread pool")?;
-    let worker_outputs: Vec<Result<WorkerOutput>> = thread_pool.install(|| {
-        partitions
-            .into_par_iter()
-            .map(|partition| scan_partition(config, &dict, &partition))
-            .collect()
-    });
-
-    let mut summary = ActiveRegionSummary {
-        input_intervals: intervals.len() as u64,
-        input_bases: intervals.iter().map(Interval::len).sum(),
-        ..ActiveRegionSummary::default()
-    };
-    let mut active_regions = Vec::new();
-    for worker_output in worker_outputs {
-        let worker_output = worker_output?;
-        summary.pileup_sites += worker_output.summary.pileup_sites;
-        summary.covered_sites += worker_output.summary.covered_sites;
-        summary.active_sites += worker_output.summary.active_sites;
-        summary.max_filtered_depth = summary
-            .max_filtered_depth
-            .max(worker_output.summary.max_filtered_depth);
-        active_regions.extend(worker_output.active_regions);
-    }
-
-    sort_and_merge(&mut active_regions, &dict)?;
-    summary.active_regions = active_regions.len() as u64;
-    summary.active_bases = active_regions.iter().map(Interval::len).sum();
-
-    write_bed(&config.output_active_bed, &active_regions)?;
-    write_active_region_summary(&config.output_summary, config, &summary)?;
-    Ok(summary)
+#[derive(Clone, Debug, Default)]
+struct ReplayWorkerOutput {
+    variants: Vec<VariantCall>,
+    active_regions: Vec<ReplayActiveRegionRow>,
+    active_loci: Vec<ReplayActiveLocusRow>,
+    read_observations: Vec<ReplayReadObservationRow>,
+    events: Vec<ReplayEventRow>,
 }
 
-fn validate_active_region_config(config: &ActiveRegionDiscoveryConfig) -> Result<()> {
-    if !config.input_bam.exists() {
-        bail!("input BAM not found: {}", config.input_bam.display());
+impl ReplayWorkerOutput {
+    fn extend(&mut self, other: ReplayWorkerOutput) {
+        self.variants.extend(other.variants);
+        self.active_regions.extend(other.active_regions);
+        self.active_loci.extend(other.active_loci);
+        self.read_observations.extend(other.read_observations);
+        self.events.extend(other.events);
     }
-    if !config.reference.exists() {
-        bail!("reference FASTA not found: {}", config.reference.display());
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayActiveRegionRow {
+    contig: String,
+    start: u64,
+    end: u64,
+    region: String,
+    observed_loci: u64,
+    active_loci: u64,
+    candidate_events: u64,
+    max_alt_fraction: f64,
+    mean_alt_fraction: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayActiveLocusRow {
+    contig: String,
+    pos: u64,
+    region: String,
+    ref_base: u8,
+    depth: u32,
+    snp_alt_count: u32,
+    snp_best_alt: String,
+    indel_alt_count: u32,
+    indel_best_alt: String,
+    alt_fraction: f64,
+    active_probability_proxy: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayReadObservationRow {
+    region: String,
+    read: String,
+    kind: &'static str,
+    pos: u64,
+    qpos: usize,
+    allele: String,
+    adjusted_quality: u8,
+    mapq: u8,
+    strand: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayEventRow {
+    region: String,
+    event: String,
+    chrom: String,
+    pos: u64,
+    event_type: &'static str,
+    alleles: String,
+    raw: String,
+    depth: u32,
+    ref_count: u32,
+    alt_count: u32,
+    qual: u32,
+    gt: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayGenotypeRow {
+    chrom: String,
+    pos: u64,
+    ref_allele: String,
+    alt: String,
+    qual: u32,
+    filter: &'static str,
+    gt: &'static str,
+    gq: u32,
+    dp: u32,
+    ad_ref: u32,
+    ad_alt: u32,
+    fs: f64,
+    qd: f64,
+    pl: String,
+    db: bool,
+}
+
+impl From<&VariantCall> for ReplayGenotypeRow {
+    fn from(variant: &VariantCall) -> Self {
+        let qd = if variant.depth == 0 {
+            0.0
+        } else {
+            fix_too_high_qd(f64::from(variant.qual) / f64::from(variant.depth))
+        };
+        ReplayGenotypeRow {
+            chrom: variant.contig.clone(),
+            pos: variant.pos,
+            ref_allele: String::from_utf8_lossy(&variant.ref_allele).into_owned(),
+            alt: String::from_utf8_lossy(&variant.alt_allele).into_owned(),
+            qual: variant.qual,
+            filter: "PASS",
+            gt: variant.genotype(),
+            gq: variant.gq(),
+            dp: variant.depth,
+            ad_ref: variant.ref_count,
+            ad_alt: variant.alt_count,
+            fs: variant.fs,
+            qd,
+            pl: genotype_likelihoods(variant),
+            db: variant.db,
+        }
     }
-    if !config.input_interval_list.exists() {
-        bail!(
-            "input interval_list not found: {}",
-            config.input_interval_list.display()
-        );
-    }
-    if config.min_alt_count == 0 {
-        bail!("--min-alt-count must be at least 1");
-    }
-    if config.min_indel_count == 0 {
-        bail!("--min-indel-count must be at least 1");
-    }
-    if !(0.0..=1.0).contains(&config.min_alt_fraction) {
-        bail!("--min-alt-fraction must be between 0 and 1");
-    }
-    if config.max_depth == 0 {
-        bail!("--max-depth must be at least 1");
-    }
-    if config.threads == 0 {
-        bail!("--threads must be at least 1");
-    }
-    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ReplayRowContext<'a> {
+    region: &'a str,
+    pos: u64,
+}
+
+#[derive(Clone, Debug)]
+struct NamedBaseObservation {
+    read_name: Vec<u8>,
+    qpos: usize,
+    mapq: u8,
+    observation: BaseObservation,
+}
+
+#[derive(Clone, Debug)]
+struct NamedIndelObservation {
+    read_name: Vec<u8>,
+    qpos: usize,
+    mapq: u8,
+    observation: IndelObservation,
 }
 
 fn validate_haplotype_caller_config(config: &HaplotypeCallerConfig) -> Result<()> {
@@ -219,168 +503,1058 @@ fn validate_haplotype_caller_config(config: &HaplotypeCallerConfig) -> Result<()
     Ok(())
 }
 
-fn scan_partition(
-    config: &ActiveRegionDiscoveryConfig,
-    dict: &SequenceDict,
-    intervals: &[Interval],
-) -> Result<WorkerOutput> {
-    let mut output = WorkerOutput::default();
+fn scan_call_partition(
+    config: &HaplotypeCallerConfig,
+    windows: &[FetchWindow],
+) -> Result<CallWorkerOutput> {
+    let mut output = CallWorkerOutput::default();
     let mut bam = bam::IndexedReader::from_path(&config.input_bam)
         .with_context(|| format!("opening indexed BAM {}", config.input_bam.display()))?;
     let bam_tid_by_name = bam_tid_by_name(bam.header())?;
     let reference = faidx::Reader::from_path(&config.reference)
         .with_context(|| format!("opening reference FASTA {}", config.reference.display()))?;
 
-    for interval in intervals {
-        scan_interval(
+    for window in windows {
+        scan_call_window(
             config,
-            dict,
             &bam_tid_by_name,
             &reference,
             &mut bam,
-            interval,
+            window,
             &mut output,
         )?;
     }
     Ok(output)
 }
 
-fn scan_interval(
-    config: &ActiveRegionDiscoveryConfig,
-    dict: &SequenceDict,
+fn scan_replay_partition(
+    config: &HaplotypeCallerConfig,
+    windows: &[FetchWindow],
+) -> Result<ReplayWorkerOutput> {
+    let mut output = ReplayWorkerOutput::default();
+    let mut bam = bam::IndexedReader::from_path(&config.input_bam)
+        .with_context(|| format!("opening indexed BAM {}", config.input_bam.display()))?;
+    let bam_tid_by_name = bam_tid_by_name(bam.header())?;
+    let reference = faidx::Reader::from_path(&config.reference)
+        .with_context(|| format!("opening reference FASTA {}", config.reference.display()))?;
+
+    for window in windows {
+        scan_replay_window(
+            config,
+            &bam_tid_by_name,
+            &reference,
+            &mut bam,
+            window,
+            &mut output,
+        )?;
+    }
+    Ok(output)
+}
+
+fn scan_call_window(
+    config: &HaplotypeCallerConfig,
     bam_tid_by_name: &HashMap<String, u32>,
     reference: &faidx::Reader,
     bam: &mut bam::IndexedReader,
-    interval: &Interval,
-    output: &mut WorkerOutput,
+    window: &FetchWindow,
+    output: &mut CallWorkerOutput,
 ) -> Result<()> {
-    let tid = *bam_tid_by_name.get(&interval.contig).with_context(|| {
+    let tid = *bam_tid_by_name.get(&window.contig).with_context(|| {
         format!(
             "contig '{}' from {} is not present in BAM header",
-            interval.contig,
+            window.contig,
             config.input_interval_list.display()
         )
     })?;
-    let contig_len = dict.contig_length(&interval.contig).with_context(|| {
-        format!(
-            "contig '{}' missing from interval_list header",
-            interval.contig
-        )
-    })?;
-    let ref_len = reference.fetch_seq_len(&interval.contig);
+    let ref_len = reference.fetch_seq_len(&window.contig);
     if ref_len == 0 {
         bail!(
             "contig '{}' is not present in reference FASTA {}",
-            interval.contig,
+            window.contig,
             config.reference.display()
         );
     }
-    if interval.end > ref_len {
+    if window.end > ref_len {
         bail!(
             "interval {}:{}-{} extends past FASTA contig length {}",
-            interval.contig,
-            interval.start,
-            interval.end,
+            window.contig,
+            window.start,
+            window.end,
             ref_len
         );
     }
 
+    let ref_end = window
+        .end
+        .saturating_add(u64::from(MAX_BOOTSTRAP_INDEL_LEN))
+        .min(ref_len);
     let ref_bases = reference
         .fetch_seq(
-            &interval.contig,
-            (interval.start - 1) as usize,
-            (interval.end - 1) as usize,
+            &window.contig,
+            (window.start - 1) as usize,
+            (ref_end - 1) as usize,
         )
         .with_context(|| {
             format!(
                 "fetching reference sequence {}:{}-{}",
-                interval.contig, interval.start, interval.end
+                window.contig, window.start, ref_end
             )
         })?;
 
-    bam.fetch((tid as i32, (interval.start - 1) as i64, interval.end as i64))
+    bam.fetch((tid as i32, (window.start - 1) as i64, window.end as i64))
         .with_context(|| {
             format!(
                 "fetching BAM region {}:{}-{}",
-                interval.contig, interval.start, interval.end
+                window.contig, window.start, window.end
             )
         })?;
 
     let mut pileups = bam.pileup();
-    pileups.set_max_depth(config.max_depth);
+    pileups.set_max_depth(PIPELINE_MAX_DEPTH);
+    let mut interval_cursor = 0_usize;
     for pileup in pileups {
         let pileup = pileup.with_context(|| {
             format!(
                 "reading pileup for {}:{}-{}",
-                interval.contig, interval.start, interval.end
+                window.contig, window.start, window.end
             )
         })?;
         if pileup.tid() != tid {
             continue;
         }
         let pos0 = u64::from(pileup.pos());
-        if pos0 < interval.start - 1 || pos0 >= interval.end {
+        if pos0 < window.start - 1 || pos0 >= window.end {
+            continue;
+        }
+        let pos1 = pos0 + 1;
+        if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
             continue;
         }
 
-        output.summary.pileup_sites += 1;
-        let ref_base = normalize_base(ref_bases[(pos0 - (interval.start - 1)) as usize]);
-        let evidence = pileup_evidence(&pileup, ref_base, config);
-        if evidence.depth > 0 {
-            output.summary.covered_sites += 1;
-            output.summary.max_filtered_depth =
-                output.summary.max_filtered_depth.max(evidence.depth);
+        let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
+        if let Some(call) = best_snp_call(
+            &window.contig,
+            pos1,
+            ref_base,
+            pileup_snp_evidence(&pileup, PIPELINE_MIN_BASEQ, PIPELINE_MIN_MAPQ),
+            config.standard_min_confidence_threshold_for_calling,
+        ) {
+            output.variants.push(call);
         }
-        if is_active_site(evidence, config) {
-            output.summary.active_sites += 1;
-            output.active_regions.push(padded_interval(
-                &interval.contig,
-                pos0 + 1,
-                config.active_region_padding,
-                contig_len,
-            ));
+        if let Some(call) = best_indel_call(
+            &window.contig,
+            pos1,
+            window.start,
+            &ref_bases,
+            pileup_indel_evidence(&pileup, PIPELINE_MIN_BASEQ, PIPELINE_MIN_MAPQ),
+            config.standard_min_confidence_threshold_for_calling,
+        ) {
+            output.variants.push(call);
         }
     }
     Ok(())
 }
 
-fn pileup_evidence(
-    pileup: &bam::pileup::Pileup,
-    ref_base: u8,
-    config: &ActiveRegionDiscoveryConfig,
-) -> SiteEvidence {
-    let mut evidence = SiteEvidence::default();
-    for alignment in pileup.alignments() {
-        let record = alignment.record();
-        if !standard_hc_read_filter(&record, config) || alignment.is_refskip() {
+fn scan_replay_window(
+    config: &HaplotypeCallerConfig,
+    bam_tid_by_name: &HashMap<String, u32>,
+    reference: &faidx::Reader,
+    bam: &mut bam::IndexedReader,
+    window: &FetchWindow,
+    output: &mut ReplayWorkerOutput,
+) -> Result<()> {
+    let tid = *bam_tid_by_name.get(&window.contig).with_context(|| {
+        format!(
+            "contig '{}' from {} is not present in BAM header",
+            window.contig,
+            config.input_interval_list.display()
+        )
+    })?;
+    let ref_len = reference.fetch_seq_len(&window.contig);
+    if ref_len == 0 {
+        bail!(
+            "contig '{}' is not present in reference FASTA {}",
+            window.contig,
+            config.reference.display()
+        );
+    }
+    if window.end > ref_len {
+        bail!(
+            "interval {}:{}-{} extends past FASTA contig length {}",
+            window.contig,
+            window.start,
+            window.end,
+            ref_len
+        );
+    }
+
+    let ref_end = window
+        .end
+        .saturating_add(u64::from(MAX_BOOTSTRAP_INDEL_LEN))
+        .min(ref_len);
+    let ref_bases = reference
+        .fetch_seq(
+            &window.contig,
+            (window.start - 1) as usize,
+            (ref_end - 1) as usize,
+        )
+        .with_context(|| {
+            format!(
+                "fetching reference sequence {}:{}-{}",
+                window.contig, window.start, ref_end
+            )
+        })?;
+
+    bam.fetch((tid as i32, (window.start - 1) as i64, window.end as i64))
+        .with_context(|| {
+            format!(
+                "fetching BAM region {}:{}-{}",
+                window.contig, window.start, window.end
+            )
+        })?;
+
+    let region = region_name(&window.contig, window.start, window.end);
+    let mut active_region = ReplayActiveRegionRow {
+        contig: window.contig.clone(),
+        start: window.start,
+        end: window.end,
+        region: region.clone(),
+        ..ReplayActiveRegionRow::default()
+    };
+
+    let mut pileups = bam.pileup();
+    pileups.set_max_depth(PIPELINE_MAX_DEPTH);
+    let mut interval_cursor = 0_usize;
+    for pileup in pileups {
+        let pileup = pileup.with_context(|| {
+            format!(
+                "reading pileup for {}:{}-{}",
+                window.contig, window.start, window.end
+            )
+        })?;
+        if pileup.tid() != tid {
+            continue;
+        }
+        let pos0 = u64::from(pileup.pos());
+        if pos0 < window.start - 1 || pos0 >= window.end {
+            continue;
+        }
+        let pos1 = pos0 + 1;
+        if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
             continue;
         }
 
-        let base_quality_ok = alignment
-            .qpos()
-            .and_then(|qpos| record.qual().get(qpos).copied())
-            .is_some_and(|quality| quality >= config.min_baseq);
+        let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
+        let row_context = ReplayRowContext {
+            region: &region,
+            pos: pos1,
+        };
+        let (snp_evidence, snp_rows) = pileup_snp_evidence_with_rows(
+            &pileup,
+            PIPELINE_MIN_BASEQ,
+            PIPELINE_MIN_MAPQ,
+            Some(&row_context),
+        );
+        let (indel_evidence, indel_rows) = pileup_indel_evidence_with_rows(
+            &pileup,
+            PIPELINE_MIN_BASEQ,
+            PIPELINE_MIN_MAPQ,
+            Some(&row_context),
+        );
+        output.read_observations.extend(snp_rows);
+        output.read_observations.extend(indel_rows);
 
-        if let Some(qpos) = alignment.qpos() {
-            if base_quality_ok {
-                evidence.depth += 1;
-                let read_base = normalize_base(record.seq()[qpos]);
-                if is_acgt(read_base) && is_acgt(ref_base) && read_base != ref_base {
-                    evidence.alt_count += 1;
-                }
-            }
-        } else if alignment.is_del() {
-            evidence.depth += 1;
+        let ref_index = base_index(ref_base);
+        let snp_alt = best_snp_alt(ref_index, &snp_evidence);
+        let indel_alt = best_indel_alt(&indel_evidence);
+        let snp_alt_count = snp_alt.map(|(_, count)| count).unwrap_or(0);
+        let indel_alt_count = indel_alt.map(|(_, count)| *count).unwrap_or(0);
+        let depth = snp_evidence.counts.depth.max(indel_evidence.counts.depth);
+        let best_alt_count = snp_alt_count.max(indel_alt_count);
+        let alt_fraction = if depth == 0 {
+            0.0
+        } else {
+            f64::from(best_alt_count) / f64::from(depth)
+        };
+        active_region.observed_loci += 1;
+        active_region.max_alt_fraction = active_region.max_alt_fraction.max(alt_fraction);
+        active_region.mean_alt_fraction += alt_fraction;
+
+        if best_alt_count > 0 {
+            active_region.active_loci += 1;
+            output.active_loci.push(ReplayActiveLocusRow {
+                contig: window.contig.clone(),
+                pos: pos1,
+                region: region.clone(),
+                ref_base,
+                depth,
+                snp_alt_count,
+                snp_best_alt: snp_alt
+                    .map(|(base_index, _)| base_from_index(base_index) as char)
+                    .map(|base| base.to_string())
+                    .unwrap_or_default(),
+                indel_alt_count,
+                indel_best_alt: indel_alt
+                    .as_ref()
+                    .map(|(allele, _)| indel_allele_label(allele))
+                    .unwrap_or_default(),
+                alt_fraction,
+                active_probability_proxy: alt_fraction,
+            });
         }
 
-        if alignment.indel() != Indel::None && base_quality_ok {
-            evidence.indel_count += 1;
+        if let Some(call) = best_snp_call(
+            &window.contig,
+            pos1,
+            ref_base,
+            snp_evidence,
+            config.standard_min_confidence_threshold_for_calling,
+        ) {
+            active_region.candidate_events += 1;
+            output.events.push(replay_event_row(&region, &call)?);
+            output.variants.push(call);
+        }
+        if let Some(call) = best_indel_call(
+            &window.contig,
+            pos1,
+            window.start,
+            &ref_bases,
+            indel_evidence,
+            config.standard_min_confidence_threshold_for_calling,
+        ) {
+            active_region.candidate_events += 1;
+            output.events.push(replay_event_row(&region, &call)?);
+            output.variants.push(call);
         }
     }
-    evidence
+    if active_region.observed_loci > 0 {
+        active_region.mean_alt_fraction /= active_region.observed_loci as f64;
+    }
+    output.active_regions.push(active_region);
+    Ok(())
 }
 
-pub fn standard_hc_read_filter(record: &bam::Record, config: &ActiveRegionDiscoveryConfig) -> bool {
+fn pileup_snp_evidence(pileup: &bam::pileup::Pileup, min_baseq: u8, min_mapq: u8) -> SnpEvidence {
+    pileup_snp_evidence_with_rows(pileup, min_baseq, min_mapq, None).0
+}
+
+fn pileup_snp_evidence_with_rows(
+    pileup: &bam::pileup::Pileup,
+    min_baseq: u8,
+    min_mapq: u8,
+    row_context: Option<&ReplayRowContext<'_>>,
+) -> (SnpEvidence, Vec<ReplayReadObservationRow>) {
+    let mut observations_by_fragment: HashMap<Vec<u8>, Vec<NamedBaseObservation>> = HashMap::new();
+    for alignment in pileup.alignments() {
+        let record = alignment.record();
+        if !read_passes_hc_filter(&record, min_mapq, false) || alignment.is_refskip() {
+            continue;
+        }
+        let Some(qpos) = alignment.qpos() else {
+            continue;
+        };
+        if record
+            .qual()
+            .get(qpos)
+            .is_none_or(|quality| *quality < min_baseq)
+        {
+            continue;
+        }
+        let base = normalize_base(record.seq()[qpos]);
+        let Some(index) = base_index(base) else {
+            continue;
+        };
+        observations_by_fragment
+            .entry(record.qname().to_vec())
+            .or_default()
+            .push(NamedBaseObservation {
+                read_name: record.qname().to_vec(),
+                qpos,
+                mapq: record.mapq(),
+                observation: BaseObservation {
+                    base_index: index,
+                    quality: record.qual()[qpos],
+                    is_reverse: record.is_reverse(),
+                },
+            });
+    }
+
+    let mut evidence = SnpEvidence::default();
+    let mut rows = Vec::new();
+    for observations in observations_by_fragment.into_values() {
+        for named in adjust_named_base_observations(&observations) {
+            let observation = named.observation;
+            if observation.quality < min_baseq {
+                continue;
+            }
+            evidence.counts.counts[observation.base_index] += 1;
+            evidence.counts.depth += 1;
+            evidence.strands[observation.base_index].increment(observation.is_reverse);
+            evidence.observations.push(observation);
+            if let Some(context) = row_context {
+                rows.push(ReplayReadObservationRow {
+                    region: context.region.to_string(),
+                    read: String::from_utf8_lossy(&named.read_name).into_owned(),
+                    kind: "snp",
+                    pos: context.pos,
+                    qpos: named.qpos,
+                    allele: (base_from_index(observation.base_index) as char).to_string(),
+                    adjusted_quality: observation.quality,
+                    mapq: named.mapq,
+                    strand: strand_label(observation.is_reverse),
+                });
+            }
+        }
+    }
+    (evidence, rows)
+}
+
+#[cfg(test)]
+fn adjust_fragment_base_observations(observations: &[BaseObservation]) -> Vec<BaseObservation> {
+    if observations.len() <= 1 {
+        return observations.to_vec();
+    }
+
+    let first_base_index = observations[0].base_index;
+    if observations
+        .iter()
+        .all(|observation| observation.base_index == first_base_index)
+    {
+        observations
+            .iter()
+            .map(|observation| BaseObservation {
+                quality: observation.quality.min(HALF_DEFAULT_PCR_SNV_QUAL),
+                ..*observation
+            })
+            .collect()
+    } else {
+        observations
+            .iter()
+            .map(|observation| BaseObservation {
+                quality: 0,
+                ..*observation
+            })
+            .collect()
+    }
+}
+
+fn adjust_named_base_observations(
+    observations: &[NamedBaseObservation],
+) -> Vec<NamedBaseObservation> {
+    if observations.len() <= 1 {
+        return observations.to_vec();
+    }
+
+    let first_base_index = observations[0].observation.base_index;
+    let all_same_base = observations
+        .iter()
+        .all(|observation| observation.observation.base_index == first_base_index);
+    observations
+        .iter()
+        .map(|observation| {
+            let mut adjusted = observation.clone();
+            adjusted.observation.quality = if all_same_base {
+                adjusted.observation.quality.min(HALF_DEFAULT_PCR_SNV_QUAL)
+            } else {
+                0
+            };
+            adjusted
+        })
+        .collect()
+}
+
+fn pileup_indel_evidence(
+    pileup: &bam::pileup::Pileup,
+    min_baseq: u8,
+    min_mapq: u8,
+) -> IndelEvidence {
+    pileup_indel_evidence_with_rows(pileup, min_baseq, min_mapq, None).0
+}
+
+fn pileup_indel_evidence_with_rows(
+    pileup: &bam::pileup::Pileup,
+    min_baseq: u8,
+    min_mapq: u8,
+    row_context: Option<&ReplayRowContext<'_>>,
+) -> (IndelEvidence, Vec<ReplayReadObservationRow>) {
+    let mut observations_by_fragment: HashMap<Vec<u8>, Vec<NamedIndelObservation>> = HashMap::new();
+    for alignment in pileup.alignments() {
+        let record = alignment.record();
+        if !read_passes_hc_filter(&record, min_mapq, false) || alignment.is_refskip() {
+            continue;
+        }
+        let Some(qpos) = alignment.qpos() else {
+            continue;
+        };
+        if record
+            .qual()
+            .get(qpos)
+            .is_none_or(|quality| *quality < min_baseq)
+        {
+            continue;
+        }
+        let allele = match alignment.indel() {
+            Indel::None => Some(IndelObservationAllele::Ref),
+            Indel::Ins(len) if len <= MAX_BOOTSTRAP_INDEL_LEN => {
+                let inserted = inserted_bases(&record, qpos, len);
+                if inserted.is_empty() {
+                    None
+                } else {
+                    Some(IndelObservationAllele::Alt(IndelAllele::Insertion(
+                        inserted,
+                    )))
+                }
+            }
+            Indel::Del(len) if len <= MAX_BOOTSTRAP_INDEL_LEN => {
+                Some(IndelObservationAllele::Alt(IndelAllele::Deletion(len)))
+            }
+            _ => None,
+        };
+        let Some(allele) = allele else {
+            continue;
+        };
+        observations_by_fragment
+            .entry(record.qname().to_vec())
+            .or_default()
+            .push(NamedIndelObservation {
+                read_name: record.qname().to_vec(),
+                qpos,
+                mapq: record.mapq(),
+                observation: IndelObservation {
+                    allele,
+                    quality: indel_observation_quality(record.qual()[qpos]),
+                    is_reverse: record.is_reverse(),
+                },
+            });
+    }
+
+    let mut evidence = IndelEvidence::default();
+    let mut rows = Vec::new();
+    for observations in observations_by_fragment.into_values() {
+        for named in adjust_named_indel_observations(&observations) {
+            let observation = named.observation;
+            if observation.quality < min_baseq {
+                continue;
+            }
+            evidence.counts.depth += 1;
+            match &observation.allele {
+                IndelObservationAllele::Ref => {
+                    evidence.counts.ref_count += 1;
+                    evidence.ref_strand.increment(observation.is_reverse);
+                }
+                IndelObservationAllele::Alt(allele) => {
+                    *evidence.counts.counts.entry(allele.clone()).or_insert(0) += 1;
+                    evidence
+                        .alt_strands
+                        .entry(allele.clone())
+                        .or_default()
+                        .increment(observation.is_reverse);
+                }
+            }
+            if let Some(context) = row_context {
+                rows.push(ReplayReadObservationRow {
+                    region: context.region.to_string(),
+                    read: String::from_utf8_lossy(&named.read_name).into_owned(),
+                    kind: "indel",
+                    pos: context.pos,
+                    qpos: named.qpos,
+                    allele: indel_observation_allele_label(&observation.allele),
+                    adjusted_quality: observation.quality,
+                    mapq: named.mapq,
+                    strand: strand_label(observation.is_reverse),
+                });
+            }
+            evidence.observations.push(observation);
+        }
+    }
+    (evidence, rows)
+}
+
+fn adjust_named_indel_observations(
+    observations: &[NamedIndelObservation],
+) -> Vec<NamedIndelObservation> {
+    observations.to_vec()
+}
+
+fn indel_observation_quality(base_quality: u8) -> u8 {
+    base_quality.min(DEFAULT_INDEL_QUAL)
+}
+
+fn best_snp_call(
+    contig: &str,
+    pos: u64,
+    ref_base: u8,
+    evidence: SnpEvidence,
+    min_qual: f64,
+) -> Option<VariantCall> {
+    let ref_index = base_index(ref_base)?;
+    let mut best_alt_index = None;
+    let mut best_alt_count = 0_u32;
+    for (index, count) in evidence.counts.counts.iter().copied().enumerate() {
+        if index == ref_index || count <= best_alt_count {
+            continue;
+        }
+        best_alt_index = Some(index);
+        best_alt_count = count;
+    }
+    let alt_index = best_alt_index?;
+    if !alt_support_passes(evidence.counts.depth, best_alt_count) {
+        return None;
+    }
+    let model = snp_variant_model(&evidence.observations, ref_index, alt_index);
+    if f64::from(model.qual) < min_qual {
+        return None;
+    }
+
+    Some(VariantCall {
+        contig: contig.to_string(),
+        pos,
+        id: None,
+        db: false,
+        ref_allele: vec![ref_base],
+        alt_allele: vec![base_from_index(alt_index)],
+        depth: evidence.counts.depth,
+        ref_count: evidence.counts.counts[ref_index],
+        alt_count: best_alt_count,
+        qual: model.qual,
+        fs: fisher_strand_score(evidence.strands[ref_index], evidence.strands[alt_index]),
+        pl: model.pl,
+        genotype_index: model.genotype_index,
+    })
+}
+
+fn best_snp_alt(ref_index: Option<usize>, evidence: &SnpEvidence) -> Option<(usize, u32)> {
+    let ref_index = ref_index?;
+    let mut best_alt_index = None;
+    let mut best_alt_count = 0_u32;
+    for (index, count) in evidence.counts.counts.iter().copied().enumerate() {
+        if index == ref_index || count <= best_alt_count {
+            continue;
+        }
+        best_alt_index = Some(index);
+        best_alt_count = count;
+    }
+    best_alt_index.map(|index| (index, best_alt_count))
+}
+
+fn best_indel_call(
+    contig: &str,
+    pos: u64,
+    ref_start: u64,
+    ref_bases: &[u8],
+    evidence: IndelEvidence,
+    min_qual: f64,
+) -> Option<VariantCall> {
+    let (best_allele, best_alt_count) =
+        evidence
+            .counts
+            .counts
+            .iter()
+            .max_by(|(allele_a, count_a), (allele_b, count_b)| {
+                count_a.cmp(count_b).then_with(|| {
+                    indel_allele_sort_key(allele_a).cmp(&indel_allele_sort_key(allele_b))
+                })
+            })?;
+    if !alt_support_passes(evidence.counts.depth, *best_alt_count) {
+        return None;
+    }
+    let model = indel_variant_model(&evidence.observations, best_allele);
+    if f64::from(model.qual) < min_qual {
+        return None;
+    }
+
+    let offset = usize::try_from(pos.checked_sub(ref_start)?).ok()?;
+    let anchor = normalize_base(*ref_bases.get(offset)?);
+    if !is_acgt(anchor) {
+        return None;
+    }
+    let (ref_allele, alt_allele) = match best_allele {
+        IndelAllele::Insertion(inserted) => {
+            if inserted.iter().any(|base| !is_acgt(*base)) {
+                return None;
+            }
+            let mut alt_allele = Vec::with_capacity(inserted.len() + 1);
+            alt_allele.push(anchor);
+            alt_allele.extend_from_slice(inserted);
+            (vec![anchor], alt_allele)
+        }
+        IndelAllele::Deletion(len) => {
+            let delete_len = usize::try_from(*len).ok()?;
+            let end_offset = offset.checked_add(delete_len)?;
+            let deleted = ref_bases.get(offset..=end_offset)?;
+            let ref_allele: Vec<u8> = deleted.iter().map(|base| normalize_base(*base)).collect();
+            if ref_allele.iter().any(|base| !is_acgt(*base)) {
+                return None;
+            }
+            (ref_allele, vec![anchor])
+        }
+    };
+    let (pos, ref_allele, alt_allele) =
+        left_normalize_indel(pos, ref_start, ref_bases, ref_allele, alt_allele);
+
+    Some(VariantCall {
+        contig: contig.to_string(),
+        pos,
+        id: None,
+        db: false,
+        ref_allele,
+        alt_allele,
+        depth: evidence.counts.depth,
+        ref_count: evidence.counts.ref_count,
+        alt_count: *best_alt_count,
+        qual: model.qual,
+        fs: fisher_strand_score(
+            evidence.ref_strand,
+            evidence
+                .alt_strands
+                .get(best_allele)
+                .copied()
+                .unwrap_or_default(),
+        ),
+        pl: model.pl,
+        genotype_index: model.genotype_index,
+    })
+}
+
+fn best_indel_alt(evidence: &IndelEvidence) -> Option<(&IndelAllele, &u32)> {
+    evidence
+        .counts
+        .counts
+        .iter()
+        .max_by(|(allele_a, count_a), (allele_b, count_b)| {
+            count_a
+                .cmp(count_b)
+                .then_with(|| indel_allele_sort_key(allele_a).cmp(&indel_allele_sort_key(allele_b)))
+        })
+}
+
+fn replay_event_row(region: &str, call: &VariantCall) -> Result<ReplayEventRow> {
+    let event_type = if call.ref_allele.len() == 1 && call.alt_allele.len() == 1 {
+        "SNP"
+    } else {
+        "INDEL"
+    };
+    let ref_allele = allele_string(&call.ref_allele)?.to_string();
+    let alt_allele = allele_string(&call.alt_allele)?.to_string();
+    let event = format!(
+        "{}:{}:{}:{}*,{}",
+        call.contig, call.pos, event_type, ref_allele, alt_allele
+    );
+    let alleles = format!("{}*,{}", ref_allele, alt_allele);
+    let raw = format!(
+        "{} depth={} ref_count={} alt_count={} qual={} gt={}",
+        event,
+        call.depth,
+        call.ref_count,
+        call.alt_count,
+        call.qual,
+        call.genotype()
+    );
+    Ok(ReplayEventRow {
+        region: region.to_string(),
+        event,
+        chrom: call.contig.clone(),
+        pos: call.pos,
+        event_type,
+        alleles,
+        raw,
+        depth: call.depth,
+        ref_count: call.ref_count,
+        alt_count: call.alt_count,
+        qual: call.qual,
+        gt: call.genotype(),
+    })
+}
+
+fn inserted_bases(record: &bam::Record, qpos: usize, len: u32) -> Vec<u8> {
+    let len = len as usize;
+    let start = qpos.saturating_add(1);
+    let end = start.saturating_add(len);
+    if end > record.seq_len() {
+        return Vec::new();
+    }
+    (start..end)
+        .map(|idx| normalize_base(record.seq()[idx]))
+        .collect()
+}
+
+fn indel_allele_sort_key(allele: &IndelAllele) -> (u8, u32, Vec<u8>) {
+    match allele {
+        IndelAllele::Insertion(bases) => (0, bases.len() as u32, bases.clone()),
+        IndelAllele::Deletion(len) => (1, *len, Vec::new()),
+    }
+}
+
+fn left_normalize_indel(
+    mut pos: u64,
+    ref_start: u64,
+    ref_bases: &[u8],
+    mut ref_allele: Vec<u8>,
+    mut alt_allele: Vec<u8>,
+) -> (u64, Vec<u8>, Vec<u8>) {
+    if ref_allele.len() == alt_allele.len() {
+        return (pos, ref_allele, alt_allele);
+    }
+
+    loop {
+        let mut changed = false;
+        while ref_allele.len() > 1 && alt_allele.len() > 1 && ref_allele.last() == alt_allele.last()
+        {
+            ref_allele.pop();
+            alt_allele.pop();
+            changed = true;
+        }
+        while ref_allele.len() > 1
+            && alt_allele.len() > 1
+            && ref_allele.first() == alt_allele.first()
+        {
+            ref_allele.remove(0);
+            alt_allele.remove(0);
+            pos += 1;
+            changed = true;
+        }
+        if ref_allele.last() == alt_allele.last() && pos > ref_start {
+            let Some(prev_base) = reference_base_at(ref_bases, ref_start, pos - 1) else {
+                break;
+            };
+            if !is_acgt(prev_base) {
+                break;
+            }
+            ref_allele.insert(0, prev_base);
+            alt_allele.insert(0, prev_base);
+            pos -= 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    (pos, ref_allele, alt_allele)
+}
+
+fn reference_base_at(ref_bases: &[u8], ref_start: u64, pos: u64) -> Option<u8> {
+    let offset = usize::try_from(pos.checked_sub(ref_start)?).ok()?;
+    ref_bases.get(offset).map(|base| normalize_base(*base))
+}
+
+fn indel_observation_allele_label(allele: &IndelObservationAllele) -> String {
+    match allele {
+        IndelObservationAllele::Ref => "REF".to_string(),
+        IndelObservationAllele::Alt(allele) => indel_allele_label(allele),
+    }
+}
+
+fn indel_allele_label(allele: &IndelAllele) -> String {
+    match allele {
+        IndelAllele::Insertion(bases) => {
+            format!("INS:{}", String::from_utf8_lossy(bases))
+        }
+        IndelAllele::Deletion(len) => format!("DEL:{len}"),
+    }
+}
+
+fn strand_label(is_reverse: bool) -> &'static str {
+    if is_reverse {
+        "-"
+    } else {
+        "+"
+    }
+}
+
+fn region_name(contig: &str, start: u64, end: u64) -> String {
+    format!("{contig}:{start}-{end}")
+}
+
+fn alt_support_passes(depth: u32, alt_count: u32) -> bool {
+    depth > 0 && alt_count > 0
+}
+
+fn snp_variant_model(
+    observations: &[BaseObservation],
+    ref_index: usize,
+    alt_index: usize,
+) -> VariantModel {
+    let mut log10_likelihoods = [0.0_f64; 3];
+    for observation in observations {
+        let error = phred_error_probability(observation.quality);
+        let ref_prob = snp_observation_probability(observation.base_index == ref_index, error);
+        let alt_prob = snp_observation_probability(observation.base_index == alt_index, error);
+        add_diploid_observation(&mut log10_likelihoods, ref_prob, alt_prob);
+    }
+
+    let snp_het = 1e-3_f64.log10() - 3.0_f64.log10();
+    variant_model_from_log10(log10_likelihoods, [0.0, snp_het, snp_het * 2.0])
+}
+
+fn indel_variant_model(
+    observations: &[IndelObservation],
+    alt_allele: &IndelAllele,
+) -> VariantModel {
+    let mut log10_likelihoods = [0.0_f64; 3];
+    for observation in observations {
+        let error = phred_error_probability(observation.quality);
+        let ref_prob = match &observation.allele {
+            IndelObservationAllele::Ref => 1.0 - error,
+            IndelObservationAllele::Alt(_) => error,
+        }
+        .max(f64::MIN_POSITIVE);
+        let alt_prob = match &observation.allele {
+            IndelObservationAllele::Alt(allele) if allele == alt_allele => 1.0 - error,
+            _ => error,
+        }
+        .max(f64::MIN_POSITIVE);
+        add_diploid_observation(&mut log10_likelihoods, ref_prob, alt_prob);
+    }
+
+    let indel_het = (1.0_f64 / 8_000.0).log10();
+    variant_model_from_log10(log10_likelihoods, [0.0, indel_het, indel_het * 2.0])
+}
+
+fn snp_observation_probability(matches_allele: bool, error: f64) -> f64 {
+    if matches_allele {
+        1.0 - error
+    } else {
+        error / 3.0
+    }
+    .max(f64::MIN_POSITIVE)
+}
+
+fn add_diploid_observation(log10_likelihoods: &mut [f64; 3], ref_prob: f64, alt_prob: f64) {
+    log10_likelihoods[0] += ref_prob.log10();
+    log10_likelihoods[1] += (0.5 * ref_prob + 0.5 * alt_prob)
+        .max(f64::MIN_POSITIVE)
+        .log10();
+    log10_likelihoods[2] += alt_prob.log10();
+}
+
+fn phred_error_probability(quality: u8) -> f64 {
+    10_f64.powf(-f64::from(quality.min(MAX_SAM_QUAL)) / 10.0)
+}
+
+fn variant_model_from_log10(log10_likelihoods: [f64; 3], log10_priors: [f64; 3]) -> VariantModel {
+    let log10_posteriors = [
+        log10_likelihoods[0] + log10_priors[0],
+        log10_likelihoods[1] + log10_priors[1],
+        log10_likelihoods[2] + log10_priors[2],
+    ];
+    let genotype_index = max_index(&log10_posteriors);
+    let denominator = log10_sum_exp(&log10_posteriors);
+    let ref_posterior_log10 = log10_posteriors[0] - denominator;
+    let qual = phred_from_log10_probability(ref_posterior_log10);
+    let best_posterior = log10_posteriors[genotype_index];
+    let pl = [
+        phred_likelihood_delta(log10_posteriors[0], best_posterior),
+        phred_likelihood_delta(log10_posteriors[1], best_posterior),
+        phred_likelihood_delta(log10_posteriors[2], best_posterior),
+    ];
+
+    VariantModel {
+        qual,
+        pl,
+        genotype_index,
+    }
+}
+
+fn max_index(values: &[f64; 3]) -> usize {
+    if values[2] > values[1] && values[2] > values[0] {
+        2
+    } else if values[1] > values[0] {
+        1
+    } else {
+        0
+    }
+}
+
+fn log10_sum_exp(values: &[f64]) -> f64 {
+    let max = values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, |acc, value| acc.max(value));
+    if !max.is_finite() {
+        return max;
+    }
+    let sum: f64 = values.iter().map(|value| 10_f64.powf(value - max)).sum();
+    max + sum.log10()
+}
+
+fn phred_from_log10_probability(log10_probability: f64) -> u32 {
+    if log10_probability <= -999.9 {
+        9_999
+    } else {
+        (-10.0 * log10_probability).round().clamp(0.0, 9_999.0) as u32
+    }
+}
+
+fn phred_likelihood_delta(log10_value: f64, best_log10_value: f64) -> u32 {
+    (-10.0 * (log10_value - best_log10_value))
+        .round()
+        .clamp(0.0, 999.0) as u32
+}
+
+fn fisher_strand_score(ref_strand: StrandCounts, alt_strand: StrandCounts) -> f64 {
+    let pvalue = fisher_exact_pvalue(ref_strand, alt_strand);
+    -10.0 * pvalue.max(FISHER_STRAND_MIN_PVALUE).log10()
+}
+
+fn fisher_exact_pvalue(ref_strand: StrandCounts, alt_strand: StrandCounts) -> f64 {
+    let table = normalize_fisher_table([
+        [ref_strand.forward, ref_strand.reverse],
+        [alt_strand.forward, alt_strand.reverse],
+    ]);
+    let row_ref = table[0][0] + table[0][1];
+    let row_alt = table[1][0] + table[1][1];
+    let col_forward = table[0][0] + table[1][0];
+    let total = row_ref + row_alt;
+    let lo = col_forward.saturating_sub(row_alt);
+    let hi = col_forward.min(row_ref);
+    if hi <= lo {
+        return 1.0;
+    }
+
+    let observed = table[0][0];
+    let observed_log = hypergeometric_log_probability(observed, total, row_ref, col_forward);
+    let mut pvalue = 0.0;
+    for value in lo..=hi {
+        let logp = hypergeometric_log_probability(value, total, row_ref, col_forward);
+        if logp <= observed_log + 1e-12 {
+            pvalue += logp.exp();
+        }
+    }
+    pvalue.min(1.0)
+}
+
+fn normalize_fisher_table(mut table: [[u32; 2]; 2]) -> [[u32; 2]; 2] {
+    let sum = table[0][0] + table[0][1] + table[1][0] + table[1][1];
+    if f64::from(sum) <= FISHER_STRAND_TARGET_TABLE_SIZE * 2.0 {
+        return table;
+    }
+    let factor = f64::from(sum) / FISHER_STRAND_TARGET_TABLE_SIZE;
+    for row in &mut table {
+        for value in row {
+            *value = (f64::from(*value) / factor) as u32;
+        }
+    }
+    table
+}
+
+fn hypergeometric_log_probability(k: u32, population: u32, success_states: u32, draws: u32) -> f64 {
+    log_choose(success_states, k) + log_choose(population - success_states, draws - k)
+        - log_choose(population, draws)
+}
+
+fn log_choose(n: u32, k: u32) -> f64 {
+    if k > n {
+        return f64::NEG_INFINITY;
+    }
+    log_factorial(n) - log_factorial(k) - log_factorial(n - k)
+}
+
+fn log_factorial(n: u32) -> f64 {
+    (2..=n).map(|value| f64::from(value).ln()).sum()
+}
+
+fn read_passes_hc_filter(record: &bam::Record, min_mapq: u8, exclude_supplementary: bool) -> bool {
     const UNMAPPED: u16 = 0x4;
     const SECONDARY: u16 = 0x100;
     const QCFAIL: u16 = 0x200;
@@ -388,13 +1562,11 @@ pub fn standard_hc_read_filter(record: &bam::Record, config: &ActiveRegionDiscov
     const SUPPLEMENTARY: u16 = 0x800;
 
     let mut excluded = UNMAPPED | SECONDARY | QCFAIL | DUPLICATE;
-    if config.exclude_supplementary {
+    if exclude_supplementary {
         excluded |= SUPPLEMENTARY;
     }
 
-    record.flags() & excluded == 0
-        && record.mapq() >= config.min_mapq
-        && cigar_has_reference_bases(record)
+    record.flags() & excluded == 0 && record.mapq() >= min_mapq && cigar_has_reference_bases(record)
 }
 
 fn cigar_has_reference_bases(record: &bam::Record) -> bool {
@@ -406,43 +1578,78 @@ fn cigar_has_reference_bases(record: &bam::Record) -> bool {
     })
 }
 
-fn is_active_site(evidence: SiteEvidence, config: &ActiveRegionDiscoveryConfig) -> bool {
-    if evidence.indel_count >= config.min_indel_count {
-        return true;
+fn position_is_requested(intervals: &[Interval], pos1: u64, cursor: &mut usize) -> bool {
+    while *cursor < intervals.len() && intervals[*cursor].end < pos1 {
+        *cursor += 1;
     }
-    if evidence.depth == 0 || evidence.alt_count < config.min_alt_count {
-        return false;
-    }
-    f64::from(evidence.alt_count) / f64::from(evidence.depth) >= config.min_alt_fraction
+    intervals
+        .get(*cursor)
+        .is_some_and(|interval| interval.start <= pos1 && pos1 <= interval.end)
 }
 
-fn padded_interval(contig: &str, pos1: u64, padding: u64, contig_len: u64) -> Interval {
-    Interval {
-        contig: contig.to_string(),
-        start: pos1.saturating_sub(padding).max(1),
-        end: pos1.saturating_add(padding).min(contig_len),
+fn sort_intervals(intervals: &mut [Interval], dict: &SequenceDict) -> Result<()> {
+    for interval in intervals.iter() {
+        if dict.order(&interval.contig).is_none() {
+            bail!(
+                "contig '{}' is not present in the sequence dictionary",
+                interval.contig
+            );
+        }
     }
+    intervals.sort_by(|a, b| {
+        dict.order(&a.contig)
+            .cmp(&dict.order(&b.contig))
+            .then(a.start.cmp(&b.start))
+            .then(a.end.cmp(&b.end))
+    });
+    Ok(())
 }
 
-fn partition_intervals_by_bases(intervals: &[Interval], threads: usize) -> Vec<Vec<Interval>> {
-    if intervals.is_empty() {
+fn coalesce_fetch_windows(intervals: &[Interval]) -> Vec<FetchWindow> {
+    let mut windows: Vec<FetchWindow> = Vec::new();
+    for interval in intervals {
+        if let Some(current) = windows.last_mut() {
+            let same_contig = current.contig == interval.contig;
+            let close_enough = interval.start <= current.end.saturating_add(FETCH_WINDOW_GAP + 1);
+            let merged_len = interval.end.saturating_sub(current.start).saturating_add(1);
+            if same_contig && close_enough && merged_len <= FETCH_WINDOW_MAX_BASES {
+                current.end = current.end.max(interval.end);
+                current.intervals.push(interval.clone());
+                continue;
+            }
+        }
+        windows.push(FetchWindow {
+            contig: interval.contig.clone(),
+            start: interval.start,
+            end: interval.end,
+            intervals: vec![interval.clone()],
+        });
+    }
+    windows
+}
+
+fn partition_fetch_windows_by_bases(
+    windows: &[FetchWindow],
+    threads: usize,
+) -> Vec<Vec<FetchWindow>> {
+    if windows.is_empty() {
         return Vec::new();
     }
-    let workers = threads.min(intervals.len()).max(1);
-    let total_bases: u64 = intervals.iter().map(Interval::len).sum();
+    let workers = threads.min(windows.len()).max(1);
+    let total_bases: u64 = windows.iter().map(FetchWindow::len).sum();
     let target_bases = total_bases.div_ceil(workers as u64).max(1);
 
     let mut partitions = Vec::with_capacity(workers);
     let mut current = Vec::new();
     let mut current_bases = 0_u64;
-    for interval in intervals {
+    for window in windows {
         if !current.is_empty() && partitions.len() + 1 < workers && current_bases >= target_bases {
             partitions.push(current);
             current = Vec::new();
             current_bases = 0;
         }
-        current_bases += interval.len();
-        current.push(interval.clone());
+        current_bases += window.len();
+        current.push(window.clone());
     }
     if !current.is_empty() {
         partitions.push(current);
@@ -519,8 +1726,8 @@ fn parse_dict_lines(lines: &[String], path: &Path) -> Result<SequenceDict> {
         if index_by_name.contains_key(&name) {
             bail!("duplicate contig '{name}' in {}", path.display());
         }
-        index_by_name.insert(name, records.len());
-        records.push(DictRecord { length });
+        index_by_name.insert(name.clone(), records.len());
+        records.push(DictRecord { name, length });
     }
     if records.is_empty() {
         bail!("no @SQ records found in {}", path.display());
@@ -585,96 +1792,529 @@ fn bam_tid_by_name(header: &bam::HeaderView) -> Result<HashMap<String, u32>> {
     Ok(tids)
 }
 
-fn sort_and_merge(intervals: &mut Vec<Interval>, dict: &SequenceDict) -> Result<()> {
-    for interval in intervals.iter() {
-        if dict.order(&interval.contig).is_none() {
+fn annotate_dbsnp(path: &Path, variants: &mut [VariantCall]) -> Result<()> {
+    if variants.is_empty() {
+        return Ok(());
+    }
+    let mut reader = tbx::Reader::from_path(path)
+        .with_context(|| format!("opening dbSNP {}", path.display()))?;
+    let mut tid_cache: HashMap<String, Option<u64>> = HashMap::new();
+    let mut record = Vec::new();
+    for variant in variants {
+        let tid = match tid_cache.get(&variant.contig) {
+            Some(tid) => *tid,
+            None => {
+                let tid = reader.tid(&variant.contig).ok();
+                tid_cache.insert(variant.contig.clone(), tid);
+                tid
+            }
+        };
+        let Some(tid) = tid else {
+            continue;
+        };
+        let start0 = variant.pos.saturating_sub(1);
+        let end0 = variant
+            .pos
+            .saturating_add(variant.ref_allele.len() as u64)
+            .max(start0 + 1);
+        if reader.fetch(tid, start0, end0).is_err() {
+            continue;
+        }
+        while TbxRead::read(&mut reader, &mut record)
+            .with_context(|| format!("reading dbSNP {}", path.display()))?
+        {
+            if dbsnp_record_matches(&record, variant)? {
+                let id = dbsnp_record_id(&record)?;
+                if !id.is_empty() {
+                    variant.id = Some(id);
+                }
+                variant.db = true;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dbsnp_record_matches(record: &[u8], variant: &VariantCall) -> Result<bool> {
+    if record.starts_with(b"#") {
+        return Ok(false);
+    }
+    let line = std::str::from_utf8(record).context("dbSNP record is not UTF-8")?;
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() < 5 {
+        return Ok(false);
+    }
+    let pos = fields[1]
+        .parse::<u64>()
+        .with_context(|| format!("invalid dbSNP POS value '{}'", fields[1]))?;
+    if fields[0] != variant.contig || pos != variant.pos {
+        return Ok(false);
+    }
+    if fields[3].as_bytes() != variant.ref_allele {
+        return Ok(false);
+    }
+    Ok(fields[4]
+        .split(',')
+        .any(|alt| alt.as_bytes() == variant.alt_allele))
+}
+
+fn dbsnp_record_id(record: &[u8]) -> Result<String> {
+    let line = std::str::from_utf8(record).context("dbSNP record is not UTF-8")?;
+    let Some(id) = line.split('\t').nth(2) else {
+        return Ok(String::new());
+    };
+    if id == "." {
+        Ok(String::new())
+    } else {
+        Ok(id.to_string())
+    }
+}
+
+fn sort_variant_calls(variants: &mut [VariantCall], dict: &SequenceDict) -> Result<()> {
+    for variant in variants.iter() {
+        if dict.order(&variant.contig).is_none() {
             bail!(
                 "contig '{}' is not present in the sequence dictionary",
-                interval.contig
+                variant.contig
             );
         }
     }
-    intervals.sort_by(|a, b| {
+    variants.sort_by(|a, b| {
+        dict.order(&a.contig)
+            .cmp(&dict.order(&b.contig))
+            .then(a.pos.cmp(&b.pos))
+            .then(a.ref_allele.cmp(&b.ref_allele))
+            .then(a.alt_allele.cmp(&b.alt_allele))
+    });
+    Ok(())
+}
+
+fn dedup_variant_calls(variants: &mut Vec<VariantCall>) {
+    variants.dedup_by(|a, b| {
+        a.contig == b.contig
+            && a.pos == b.pos
+            && a.ref_allele == b.ref_allele
+            && a.alt_allele == b.alt_allele
+    });
+}
+
+fn write_bootstrap_vcf(
+    path: &Path,
+    config: &HaplotypeCallerConfig,
+    dict: &SequenceDict,
+    sample_name: &str,
+    variants: &[VariantCall],
+) -> Result<()> {
+    create_parent_dir(path)?;
+    let mut writer = open_vcf_writer(path)?;
+    writeln!(writer, "##fileformat=VCFv4.2")?;
+    writeln!(writer, "##source=rust_haplotype_caller_pipeline_bootstrap")?;
+    writeln!(
+        writer,
+        "##rust_hc_pipeline_bootstrap=Pipeline-only pileup SNP/short-indel caller; local assembly, PairHMM, phasing, and GVCF are not implemented"
+    )?;
+    writeln!(writer, "##reference={}", config.reference.display())?;
+    for record in &dict.records {
+        writeln!(
+            writer,
+            "##contig=<ID={},length={}>",
+            record.name, record.length
+        )?;
+    }
+    writeln!(
+        writer,
+        "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count in genotypes\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency in genotypes\">"
+    )?;
+    writeln!(writer, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">")?;
+    writeln!(writer, "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Filtered fragment depth used by the pipeline-only Rust caller\">")?;
+    writeln!(
+        writer,
+        "##INFO=<ID=DB,Number=0,Type=Flag,Description=\"dbSNP exact REF/ALT match\">"
+    )?;
+    writeln!(writer, "##INFO=<ID=FS,Number=1,Type=Float,Description=\"FisherStrand-style strand-bias phred score from fragment evidence\">")?;
+    writeln!(writer, "##INFO=<ID=QD,Number=1,Type=Float,Description=\"QUAL divided by AD depth for the variant sample\">")?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    )?;
+    writeln!(writer, "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allelic depths for ref and alt alleles\">")?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Filtered read depth\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype quality from diploid fragment likelihoods\">"
+    )?;
+    writeln!(writer, "##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Normalized phred-scaled genotype likelihoods from fragment evidence\">")?;
+    writeln!(
+        writer,
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}",
+        sample_name
+    )?;
+    for variant in variants {
+        write_variant_record(&mut writer, variant)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn sort_replay_rows(output: &mut ReplayWorkerOutput, dict: &SequenceDict) -> Result<()> {
+    for row in &output.active_regions {
+        if dict.order(&row.contig).is_none() {
+            bail!(
+                "contig '{}' is not present in the sequence dictionary",
+                row.contig
+            );
+        }
+    }
+    for row in &output.active_loci {
+        if dict.order(&row.contig).is_none() {
+            bail!(
+                "contig '{}' is not present in the sequence dictionary",
+                row.contig
+            );
+        }
+    }
+    for row in &output.events {
+        if dict.order(&row.chrom).is_none() {
+            bail!(
+                "contig '{}' is not present in the sequence dictionary",
+                row.chrom
+            );
+        }
+    }
+    output.active_regions.sort_by(|a, b| {
         dict.order(&a.contig)
             .cmp(&dict.order(&b.contig))
             .then(a.start.cmp(&b.start))
             .then(a.end.cmp(&b.end))
     });
-
-    let mut merged: Vec<Interval> = Vec::with_capacity(intervals.len());
-    for interval in intervals.drain(..) {
-        if let Some(current) = merged.last_mut() {
-            if current.contig == interval.contig && interval.start <= current.end.saturating_add(1)
-            {
-                current.end = current.end.max(interval.end);
-                continue;
-            }
-        }
-        merged.push(interval);
-    }
-    *intervals = merged;
+    output.active_loci.sort_by(|a, b| {
+        dict.order(&a.contig)
+            .cmp(&dict.order(&b.contig))
+            .then(a.pos.cmp(&b.pos))
+            .then(a.region.cmp(&b.region))
+    });
+    output.read_observations.sort_by(|a, b| {
+        a.region
+            .cmp(&b.region)
+            .then(a.pos.cmp(&b.pos))
+            .then(a.read.cmp(&b.read))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.qpos.cmp(&b.qpos))
+    });
+    output.events.sort_by(|a, b| {
+        dict.order(&a.chrom)
+            .cmp(&dict.order(&b.chrom))
+            .then(a.pos.cmp(&b.pos))
+            .then(a.event_type.cmp(&b.event_type))
+            .then(a.alleles.cmp(&b.alleles))
+    });
     Ok(())
 }
 
-fn write_bed(path: &Path, intervals: &[Interval]) -> Result<()> {
+fn write_replay_tables(
+    prefix: &Path,
+    output: &ReplayWorkerOutput,
+    genotype_rows: &[ReplayGenotypeRow],
+) -> Result<()> {
+    write_replay_active_regions(&replay_prefixed_path(prefix, "active_regions.tsv"), output)?;
+    write_replay_active_loci(&replay_prefixed_path(prefix, "active_loci.tsv"), output)?;
+    write_replay_read_observations(
+        &replay_prefixed_path(prefix, "read_observations.tsv"),
+        output,
+    )?;
+    write_replay_events(&replay_prefixed_path(prefix, "events.tsv"), output)?;
+    write_replay_genotypes(
+        &replay_prefixed_path(prefix, "genotypes.tsv"),
+        genotype_rows,
+    )?;
+    write_empty_replay_haplotype_tables(prefix)?;
+    Ok(())
+}
+
+fn write_replay_active_regions(path: &Path, output: &ReplayWorkerOutput) -> Result<()> {
     create_parent_dir(path)?;
-    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for interval in intervals {
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
+    writeln!(
+        writer,
+        "contig\tstart\tend\tregion\tobserved_loci\tactive_loci\tcandidate_events\tmax_alt_fraction\tmean_alt_fraction"
+    )?;
+    for row in &output.active_regions {
         writeln!(
             writer,
-            "{}\t{}\t{}",
-            interval.contig,
-            interval.start - 1,
-            interval.end
-        )
-        .with_context(|| format!("writing {}", path.display()))?;
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}",
+            row.contig,
+            row.start,
+            row.end,
+            row.region,
+            row.observed_loci,
+            row.active_loci,
+            row.candidate_events,
+            row.max_alt_fraction,
+            row.mean_alt_fraction
+        )?;
     }
     Ok(())
 }
 
-fn write_active_region_summary(
-    path: &Path,
-    config: &ActiveRegionDiscoveryConfig,
-    summary: &ActiveRegionSummary,
-) -> Result<()> {
+fn write_replay_active_loci(path: &Path, output: &ReplayWorkerOutput) -> Result<()> {
     create_parent_dir(path)?;
-    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writeln!(writer, "metric\tvalue")?;
-    writeln!(writer, "mode\tactive_region_discovery")?;
-    writeln!(writer, "input_bam\t{}", config.input_bam.display())?;
-    writeln!(writer, "reference\t{}", config.reference.display())?;
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
     writeln!(
         writer,
-        "input_interval_list\t{}",
-        config.input_interval_list.display()
+        "contig\tpos\tregion\tref_base\tdepth\tsnp_alt_count\tsnp_best_alt\tindel_alt_count\tindel_best_alt\talt_fraction\tactive_probability_proxy"
     )?;
-    writeln!(writer, "threads\t{}", config.threads)?;
-    writeln!(writer, "min_mapq\t{}", config.min_mapq)?;
-    writeln!(writer, "min_baseq\t{}", config.min_baseq)?;
-    writeln!(writer, "min_alt_count\t{}", config.min_alt_count)?;
-    writeln!(writer, "min_indel_count\t{}", config.min_indel_count)?;
-    writeln!(writer, "min_alt_fraction\t{:.6}", config.min_alt_fraction)?;
+    for row in &output.active_loci {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}",
+            row.contig,
+            row.pos,
+            row.region,
+            row.ref_base as char,
+            row.depth,
+            row.snp_alt_count,
+            row.snp_best_alt,
+            row.indel_alt_count,
+            row.indel_best_alt,
+            row.alt_fraction,
+            row.active_probability_proxy
+        )?;
+    }
+    Ok(())
+}
+
+fn write_replay_read_observations(path: &Path, output: &ReplayWorkerOutput) -> Result<()> {
+    create_parent_dir(path)?;
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
     writeln!(
         writer,
-        "active_region_padding\t{}",
-        config.active_region_padding
+        "region\tread\tkind\tpos\tqpos\tallele\tadjusted_quality\tmapq\tstrand"
     )?;
-    writeln!(writer, "max_depth_setting\t{}", config.max_depth)?;
+    for row in &output.read_observations {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.region,
+            row.read,
+            row.kind,
+            row.pos,
+            row.qpos,
+            row.allele,
+            row.adjusted_quality,
+            row.mapq,
+            row.strand
+        )?;
+    }
+    Ok(())
+}
+
+fn write_replay_events(path: &Path, output: &ReplayWorkerOutput) -> Result<()> {
+    create_parent_dir(path)?;
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
     writeln!(
         writer,
-        "exclude_supplementary\t{}",
-        config.exclude_supplementary
+        "region\tevent\tchrom\tpos\ttype\talleles\traw\tdepth\tref_count\talt_count\tqual\tgt"
     )?;
-    writeln!(writer, "input_intervals\t{}", summary.input_intervals)?;
-    writeln!(writer, "input_bases\t{}", summary.input_bases)?;
-    writeln!(writer, "pileup_sites\t{}", summary.pileup_sites)?;
-    writeln!(writer, "covered_sites\t{}", summary.covered_sites)?;
-    writeln!(writer, "active_sites\t{}", summary.active_sites)?;
-    writeln!(writer, "active_regions\t{}", summary.active_regions)?;
-    writeln!(writer, "active_bases\t{}", summary.active_bases)?;
-    writeln!(writer, "max_filtered_depth\t{}", summary.max_filtered_depth)?;
+    for row in &output.events {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.region,
+            row.event,
+            row.chrom,
+            row.pos,
+            row.event_type,
+            row.alleles,
+            row.raw,
+            row.depth,
+            row.ref_count,
+            row.alt_count,
+            row.qual,
+            row.gt
+        )?;
+    }
+    Ok(())
+}
+
+fn write_replay_genotypes(path: &Path, rows: &[ReplayGenotypeRow]) -> Result<()> {
+    create_parent_dir(path)?;
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
+    writeln!(
+        writer,
+        "chrom\tpos\tref\talt\tqual\tfilter\tgt\tgq\tdp\tad_ref\tad_alt\tfs\tqd\tpl\tdb"
+    )?;
+    for row in rows {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{}\t{}",
+            row.chrom,
+            row.pos,
+            row.ref_allele,
+            row.alt,
+            row.qual,
+            row.filter,
+            row.gt,
+            row.gq,
+            row.dp,
+            row.ad_ref,
+            row.ad_alt,
+            row.fs,
+            row.qd,
+            row.pl,
+            row.db
+        )?;
+    }
+    Ok(())
+}
+
+fn write_empty_replay_haplotype_tables(prefix: &Path) -> Result<()> {
+    let mut haplotypes = BufWriter::new(File::create(replay_prefixed_path(
+        prefix,
+        "genotyper_haplotypes.tsv",
+    ))?);
+    writeln!(
+        haplotypes,
+        "region\tstage\thaplotype\tspan_start\tspan_end\tkmer\tlength\tcigar\tis_ref\tbases"
+    )?;
+
+    let mut pairhmm = BufWriter::new(File::create(replay_prefixed_path(prefix, "pairhmm.tsv"))?);
+    writeln!(
+        pairhmm,
+        "region\tread\thaplotype\tread_index\tcigar\tmapq\tloc\tunclipped_loc\tlength\tscore"
+    )?;
+
+    let mut allele_likelihoods = BufWriter::new(File::create(replay_prefixed_path(
+        prefix,
+        "allele_likelihoods.tsv",
+    ))?);
+    writeln!(
+        allele_likelihoods,
+        "region\tevent\tmatrix\tread\tread_index\tallele\tscore"
+    )?;
+    Ok(())
+}
+
+fn replay_prefixed_path(prefix: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{}", prefix.display(), suffix))
+}
+
+fn open_vcf_writer(path: &Path) -> Result<Box<dyn Write>> {
+    if is_gzip_path(path) {
+        let writer = bgzf::Writer::from_path(path)
+            .with_context(|| format!("creating bgzipped VCF {}", path.display()))?;
+        Ok(Box::new(writer))
+    } else {
+        let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Box::new(BufWriter::new(file)))
+    }
+}
+
+fn write_variant_record(writer: &mut dyn Write, variant: &VariantCall) -> Result<()> {
+    let ac = variant.alt_allele_count();
+    let af = f64::from(ac) / 2.0;
+    let qd = if variant.depth == 0 {
+        0.0
+    } else {
+        fix_too_high_qd(f64::from(variant.qual) / f64::from(variant.depth))
+    };
+    let gt = variant.genotype();
+    let pl = genotype_likelihoods(variant);
+    let ref_allele = allele_string(&variant.ref_allele)?;
+    let alt_allele = allele_string(&variant.alt_allele)?;
+    let id = variant.id.as_deref().unwrap_or(".");
+    let db = if variant.db { ";DB" } else { "" };
+    writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\tPASS\tAC={};AF={:.3};AN=2;DP={}{};FS={:.3};QD={:.2}\tGT:AD:DP:GQ:PL\t{}:{},{}:{}:{}:{}",
+        variant.contig,
+        variant.pos,
+        id,
+        ref_allele,
+        alt_allele,
+        variant.qual,
+        ac,
+        af,
+        variant.depth,
+        db,
+        variant.fs,
+        qd,
+        gt,
+        variant.ref_count,
+        variant.alt_count,
+        variant.depth,
+        variant.gq(),
+        pl
+    )?;
+    Ok(())
+}
+
+fn genotype_likelihoods(variant: &VariantCall) -> String {
+    format!("{},{},{}", variant.pl[0], variant.pl[1], variant.pl[2])
+}
+
+fn fix_too_high_qd(qd: f64) -> f64 {
+    if qd < 35.0 {
+        qd
+    } else {
+        30.0
+    }
+}
+
+fn allele_string(allele: &[u8]) -> Result<&str> {
+    std::str::from_utf8(allele).context("allele contains non-UTF-8 bases")
+}
+
+fn sample_name_from_bam(path: &Path) -> Result<String> {
+    let reader =
+        bam::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
+    let header = String::from_utf8_lossy(reader.header().as_bytes());
+    for line in header.lines() {
+        if !line.starts_with("@RG\t") {
+            continue;
+        }
+        for field in line.split('\t').skip(1) {
+            if let Some(sample) = field.strip_prefix("SM:") {
+                if !sample.is_empty() {
+                    return Ok(sample.to_string());
+                }
+            }
+        }
+    }
+    Ok("SAMPLE".to_string())
+}
+
+fn is_gzip_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "gz")
+}
+
+fn write_tabix_index(path: &Path, threads: usize) -> Result<()> {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let thread_count = threads.clamp(1, i32::MAX as usize) as i32;
+    let result = unsafe {
+        htslib::tbx_index_build3(
+            c_path.as_ptr(),
+            ptr::null(),
+            0,
+            thread_count,
+            &htslib::tbx_conf_vcf,
+        )
+    };
+    if result != 0 {
+        bail!("failed to create tabix index for {}", path.display());
+    }
     Ok(())
 }
 
@@ -696,6 +2336,26 @@ fn is_acgt(base: u8) -> bool {
     matches!(base, b'A' | b'C' | b'G' | b'T')
 }
 
+fn base_index(base: u8) -> Option<usize> {
+    match base {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'G' => Some(2),
+        b'T' => Some(3),
+        _ => None,
+    }
+}
+
+fn base_from_index(index: usize) -> u8 {
+    match index {
+        0 => b'A',
+        1 => b'C',
+        2 => b'G',
+        3 => b'T',
+        _ => unreachable!("invalid base index"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,76 +2369,92 @@ mod tests {
         parse_dict_lines(&lines, Path::new("test.interval_list")).unwrap()
     }
 
-    fn test_config() -> ActiveRegionDiscoveryConfig {
-        ActiveRegionDiscoveryConfig {
-            input_bam: PathBuf::from("in.bam"),
-            reference: PathBuf::from("ref.fa"),
-            input_interval_list: PathBuf::from("in.interval_list"),
-            output_active_bed: PathBuf::from("active.bed"),
-            output_summary: PathBuf::from("summary.tsv"),
-            min_mapq: 20,
-            min_baseq: 10,
-            min_alt_count: 2,
-            min_indel_count: 1,
-            min_alt_fraction: 0.2,
-            active_region_padding: 150,
-            max_depth: 100_000,
-            threads: 4,
-            exclude_supplementary: false,
+    fn snp_evidence(
+        ref_index: usize,
+        ref_count: u32,
+        alt_index: usize,
+        alt_count: u32,
+        quality: u8,
+    ) -> SnpEvidence {
+        let mut evidence = SnpEvidence::default();
+        for _ in 0..ref_count {
+            evidence.counts.counts[ref_index] += 1;
+            evidence.counts.depth += 1;
+            evidence.strands[ref_index].increment(false);
+            evidence.observations.push(BaseObservation {
+                base_index: ref_index,
+                quality,
+                is_reverse: false,
+            });
+        }
+        for idx in 0..alt_count {
+            let is_reverse = idx % 2 == 1;
+            evidence.counts.counts[alt_index] += 1;
+            evidence.counts.depth += 1;
+            evidence.strands[alt_index].increment(is_reverse);
+            evidence.observations.push(BaseObservation {
+                base_index: alt_index,
+                quality,
+                is_reverse,
+            });
+        }
+        evidence
+    }
+
+    fn indel_evidence(
+        ref_count: u32,
+        alt_allele: IndelAllele,
+        alt_count: u32,
+        quality: u8,
+    ) -> IndelEvidence {
+        let mut evidence = IndelEvidence::default();
+        evidence.counts.ref_count = ref_count;
+        evidence.counts.depth = ref_count + alt_count;
+        evidence.counts.counts.insert(alt_allele.clone(), alt_count);
+        for _ in 0..ref_count {
+            evidence.ref_strand.increment(false);
+            evidence.observations.push(IndelObservation {
+                allele: IndelObservationAllele::Ref,
+                quality,
+                is_reverse: false,
+            });
+        }
+        for idx in 0..alt_count {
+            let is_reverse = idx % 2 == 1;
+            evidence
+                .alt_strands
+                .entry(alt_allele.clone())
+                .or_default()
+                .increment(is_reverse);
+            evidence.observations.push(IndelObservation {
+                allele: IndelObservationAllele::Alt(alt_allele.clone()),
+                quality,
+                is_reverse,
+            });
+        }
+        evidence
+    }
+
+    fn test_variant(contig: &str, pos: u64, ref_allele: &[u8], alt_allele: &[u8]) -> VariantCall {
+        VariantCall {
+            contig: contig.to_string(),
+            pos,
+            id: None,
+            db: false,
+            ref_allele: ref_allele.to_vec(),
+            alt_allele: alt_allele.to_vec(),
+            depth: 10,
+            ref_count: 8,
+            alt_count: 2,
+            qual: 20,
+            fs: 0.0,
+            pl: [20, 0, 20],
+            genotype_index: 1,
         }
     }
 
     #[test]
-    fn active_site_requires_alt_or_indel_threshold() {
-        let config = test_config();
-        assert!(!is_active_site(
-            SiteEvidence {
-                depth: 10,
-                alt_count: 1,
-                indel_count: 0,
-            },
-            &config
-        ));
-        assert!(is_active_site(
-            SiteEvidence {
-                depth: 10,
-                alt_count: 2,
-                indel_count: 0,
-            },
-            &config
-        ));
-        assert!(is_active_site(
-            SiteEvidence {
-                depth: 0,
-                alt_count: 0,
-                indel_count: 1,
-            },
-            &config
-        ));
-    }
-
-    #[test]
-    fn active_region_padding_clamps_to_contig_bounds() {
-        assert_eq!(
-            padded_interval("chr1", 3, 10, 20),
-            Interval {
-                contig: "chr1".to_string(),
-                start: 1,
-                end: 13,
-            }
-        );
-        assert_eq!(
-            padded_interval("chr1", 18, 10, 20),
-            Interval {
-                contig: "chr1".to_string(),
-                start: 8,
-                end: 20,
-            }
-        );
-    }
-
-    #[test]
-    fn active_regions_merge_by_dictionary_order() {
+    fn intervals_sort_by_dictionary_order() {
         let dict = test_dict();
         let mut intervals = vec![
             Interval {
@@ -797,7 +2473,7 @@ mod tests {
                 end: 90,
             },
         ];
-        sort_and_merge(&mut intervals, &dict).unwrap();
+        sort_intervals(&mut intervals, &dict).unwrap();
         assert_eq!(
             intervals,
             vec![
@@ -809,6 +2485,11 @@ mod tests {
                 Interval {
                     contig: "chr1".to_string(),
                     start: 50,
+                    end: 80,
+                },
+                Interval {
+                    contig: "chr1".to_string(),
+                    start: 81,
                     end: 90,
                 },
             ]
@@ -816,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn interval_partitioning_preserves_all_bases() {
+    fn fetch_windows_coalesce_nearby_intervals() {
         let intervals = vec![
             Interval {
                 contig: "chr1".to_string(),
@@ -830,17 +2511,227 @@ mod tests {
             },
             Interval {
                 contig: "chr1".to_string(),
-                start: 31,
-                end: 60,
+                start: 2_000,
+                end: 2_010,
             },
         ];
-        let total_bases: u64 = intervals.iter().map(Interval::len).sum();
-        let partitions = partition_intervals_by_bases(&intervals, 2);
-        let partition_bases: u64 = partitions.iter().flatten().map(Interval::len).sum();
+        let windows = coalesce_fetch_windows(&intervals);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].start, 1);
+        assert_eq!(windows[0].end, 30);
+        assert_eq!(windows[0].intervals.len(), 2);
+        assert_eq!(windows[1].start, 2_000);
+    }
+
+    #[test]
+    fn fetch_window_partitioning_preserves_all_bases() {
+        let windows = vec![
+            FetchWindow {
+                contig: "chr1".to_string(),
+                start: 1,
+                end: 10,
+                intervals: Vec::new(),
+            },
+            FetchWindow {
+                contig: "chr1".to_string(),
+                start: 11,
+                end: 30,
+                intervals: Vec::new(),
+            },
+            FetchWindow {
+                contig: "chr1".to_string(),
+                start: 31,
+                end: 60,
+                intervals: Vec::new(),
+            },
+        ];
+        let total_bases: u64 = windows.iter().map(FetchWindow::len).sum();
+        let partitions = partition_fetch_windows_by_bases(&windows, 2);
+        let partition_bases: u64 = partitions.iter().flatten().map(FetchWindow::len).sum();
         assert_eq!(partition_bases, total_bases);
         assert_eq!(
             partitions.iter().map(Vec::len).sum::<usize>(),
-            intervals.len()
+            windows.len()
         );
+    }
+
+    #[test]
+    fn requested_position_uses_sorted_interval_cursor() {
+        let intervals = vec![
+            Interval {
+                contig: "chr1".to_string(),
+                start: 10,
+                end: 20,
+            },
+            Interval {
+                contig: "chr1".to_string(),
+                start: 30,
+                end: 40,
+            },
+        ];
+        let mut cursor = 0;
+        assert!(!position_is_requested(&intervals, 9, &mut cursor));
+        assert!(position_is_requested(&intervals, 10, &mut cursor));
+        assert!(position_is_requested(&intervals, 20, &mut cursor));
+        assert!(!position_is_requested(&intervals, 25, &mut cursor));
+        assert!(position_is_requested(&intervals, 35, &mut cursor));
+    }
+
+    #[test]
+    fn snp_call_uses_likelihood_quality_threshold() {
+        let evidence = snp_evidence(0, 5, 1, 5, 30);
+        assert!(best_snp_call("chr1", 10, b'A', evidence.clone(), 200.0).is_none());
+        let call = best_snp_call("chr1", 10, b'A', evidence, 20.0).unwrap();
+        assert_eq!(call.ref_allele, b"A");
+        assert_eq!(call.alt_allele, b"C");
+        assert!(call.qual >= 90);
+        assert_eq!(call.genotype(), "0/1");
+        assert_eq!(call.pl[1], 0);
+    }
+
+    #[test]
+    fn snp_call_uses_hom_alt_when_likelihoods_overcome_prior() {
+        let evidence = snp_evidence(0, 0, 1, 20, 30);
+        let call = best_snp_call("chr1", 10, b'A', evidence, 20.0).unwrap();
+        assert_eq!(call.genotype(), "1/1");
+        assert_eq!(call.alt_allele_count(), 2);
+        assert_eq!(call.pl[2], 0);
+    }
+
+    #[test]
+    fn snp_call_rejects_low_alt_fraction_noise_after_likelihoods() {
+        let evidence = snp_evidence(0, 29, 1, 2, 30);
+        assert!(best_snp_call("chr1", 10, b'A', evidence, 20.0).is_none());
+    }
+
+    #[test]
+    fn overlapping_same_base_fragment_caps_both_observations() {
+        let observations = vec![
+            BaseObservation {
+                base_index: 1,
+                quality: 35,
+                is_reverse: false,
+            },
+            BaseObservation {
+                base_index: 1,
+                quality: 33,
+                is_reverse: true,
+            },
+        ];
+        let kept = adjust_fragment_base_observations(&observations);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|observation| observation.base_index == 1));
+        assert!(kept
+            .iter()
+            .all(|observation| observation.quality == HALF_DEFAULT_PCR_SNV_QUAL));
+    }
+
+    #[test]
+    fn overlapping_discordant_fragment_zeroes_both_observations() {
+        let observations = vec![
+            BaseObservation {
+                base_index: 1,
+                quality: 35,
+                is_reverse: false,
+            },
+            BaseObservation {
+                base_index: 2,
+                quality: 33,
+                is_reverse: true,
+            },
+        ];
+        let kept = adjust_fragment_base_observations(&observations);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|observation| observation.quality == 0));
+    }
+
+    #[test]
+    fn fisher_strand_score_detects_one_sided_alt_support() {
+        let fs = fisher_strand_score(
+            StrandCounts {
+                forward: 10,
+                reverse: 0,
+            },
+            StrandCounts {
+                forward: 0,
+                reverse: 10,
+            },
+        );
+        assert!(fs > 30.0);
+    }
+
+    #[test]
+    fn insertion_call_uses_left_anchor() {
+        let evidence = indel_evidence(6, IndelAllele::Insertion(b"TG".to_vec()), 6, 30);
+        let call = best_indel_call("chr1", 100, 100, b"ACGT", evidence, 20.0).unwrap();
+        assert_eq!(call.pos, 100);
+        assert_eq!(call.ref_allele, b"A");
+        assert_eq!(call.alt_allele, b"ATG");
+        assert_eq!(call.ref_count, 6);
+        assert_eq!(call.alt_count, 6);
+    }
+
+    #[test]
+    fn deletion_call_uses_left_anchor_and_deleted_reference() {
+        let evidence = indel_evidence(6, IndelAllele::Deletion(2), 6, 30);
+        let call = best_indel_call("chr1", 100, 100, b"ACGT", evidence, 20.0).unwrap();
+        assert_eq!(call.pos, 100);
+        assert_eq!(call.ref_allele, b"ACG");
+        assert_eq!(call.alt_allele, b"A");
+    }
+
+    #[test]
+    fn indel_normalization_left_aligns_homopolymer_insertion() {
+        let (pos, ref_allele, alt_allele) =
+            left_normalize_indel(102, 100, b"ATTTG", b"T".to_vec(), b"TT".to_vec());
+        assert_eq!(pos, 100);
+        assert_eq!(ref_allele, b"A");
+        assert_eq!(alt_allele, b"AT");
+    }
+
+    #[test]
+    fn indel_normalization_left_aligns_homopolymer_deletion() {
+        let (pos, ref_allele, alt_allele) =
+            left_normalize_indel(102, 100, b"ATTTG", b"TT".to_vec(), b"T".to_vec());
+        assert_eq!(pos, 100);
+        assert_eq!(ref_allele, b"AT");
+        assert_eq!(alt_allele, b"A");
+    }
+
+    #[test]
+    fn replay_event_row_uses_gatk_like_event_key() {
+        let call = test_variant("chr1", 100, b"A", b"C");
+        let row = replay_event_row("chr1:90-110", &call).unwrap();
+        assert_eq!(row.region, "chr1:90-110");
+        assert_eq!(row.event, "chr1:100:SNP:A*,C");
+        assert_eq!(row.event_type, "SNP");
+        assert_eq!(row.alleles, "A*,C");
+        assert_eq!(row.gt, "0/1");
+    }
+
+    #[test]
+    fn dbsnp_record_match_requires_exact_ref_and_alt() {
+        let variant = test_variant("chr1", 100, b"A", b"ATG");
+        let record = b"chr1\t100\trs1\tA\tC,ATG\t.\t.\t.";
+        assert!(dbsnp_record_matches(record, &variant).unwrap());
+        assert_eq!(dbsnp_record_id(record).unwrap(), "rs1");
+        let non_match = b"chr1\t100\trs2\tA\tC,G\t.\t.\t.";
+        assert!(!dbsnp_record_matches(non_match, &variant).unwrap());
+    }
+
+    #[test]
+    fn variant_calls_sort_by_dictionary_order() {
+        let dict = test_dict();
+        let mut variants = vec![
+            test_variant("chr1", 20, b"A", b"C"),
+            test_variant("chr2", 30, b"G", b"T"),
+            test_variant("chr2", 10, b"A", b"G"),
+        ];
+        sort_variant_calls(&mut variants, &dict).unwrap();
+        assert_eq!(variants[0].contig, "chr2");
+        assert_eq!(variants[0].pos, 10);
+        assert_eq!(variants[1].contig, "chr2");
+        assert_eq!(variants[1].pos, 30);
+        assert_eq!(variants[2].contig, "chr1");
     }
 }

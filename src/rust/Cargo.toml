@@ -31,11 +31,61 @@ path = "src/bin/rust_split_n_cigar_reads.rs"
 name = "rust_interval_tools"
 path = "src/bin/rust_interval_tools.rs"
 
+[[bin]]
+name = "rust_hc_vcf_compare"
+path = "src/bin/rust_hc_vcf_compare.rs"
+
+[[bin]]
+name = "rust_hc_select_regions"
+path = "src/bin/rust_hc_select_regions.rs"
+
+[[bin]]
+name = "rust_hc_run_gatk_oracle"
+path = "src/bin/rust_hc_run_gatk_oracle.rs"
+
+[[bin]]
+name = "rust_hc_gatk_debug_extract"
+path = "src/bin/rust_hc_gatk_debug_extract.rs"
+
+[[bin]]
+name = "rust_hc_region_replay"
+path = "src/bin/rust_hc_region_replay.rs"
+
+[[bin]]
+name = "rust_hc_vcf_to_genotype_table"
+path = "src/bin/rust_hc_vcf_to_genotype_table.rs"
+
+[[bin]]
+name = "rust_hc_active_region_diff"
+path = "src/bin/rust_hc_active_region_diff.rs"
+
+[[bin]]
+name = "rust_hc_read_finalize_diff"
+path = "src/bin/rust_hc_read_finalize_diff.rs"
+
+[[bin]]
+name = "rust_hc_assembly_diff"
+path = "src/bin/rust_hc_assembly_diff.rs"
+
+[[bin]]
+name = "rust_hc_pairhmm_diff"
+path = "src/bin/rust_hc_pairhmm_diff.rs"
+
+[[bin]]
+name = "rust_hc_genotype_diff"
+path = "src/bin/rust_hc_genotype_diff.rs"
+
+[[bin]]
+name = "rust_hc_acceptance_report"
+path = "src/bin/rust_hc_acceptance_report.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.0"
 rayon = "1.10"
 rust-htslib = { version = "1.0.0", default-features = false }
+serde_json = "1.0"
 
 [dev-dependencies]
 tempfile = "3.10"
