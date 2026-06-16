@@ -9,8 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub mod split_n_cigar;
+pub mod haplotype_caller;
+pub mod hc;
 pub mod interval_tools;
+pub mod split_n_cigar;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

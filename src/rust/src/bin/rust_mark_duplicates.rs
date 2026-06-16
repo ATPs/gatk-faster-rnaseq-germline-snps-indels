@@ -4,7 +4,7 @@ use rust_htslib::bam::header::HeaderRecord;
 use rust_htslib::bam::record::Aux;
 use rust_htslib::{bam, bam::Read};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -41,14 +41,19 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=9))]
+    compression_level: u32,
+
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     create_index: bool,
 }
 
 #[derive(Clone, Debug)]
 struct HeaderLibraries {
-    by_read_group: HashMap<Vec<u8>, String>,
-    library_ids: HashMap<String, u16>,
+    by_read_group: HashMap<Vec<u8>, u16>,
+    library_names: Vec<String>,
+    declared_libraries: Vec<bool>,
+    unknown_library_id: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +118,17 @@ struct Metrics {
     read_pair_duplicates_raw: u64,
 }
 
+impl Metrics {
+    fn is_empty(&self) -> bool {
+        self.unpaired_reads_examined == 0
+            && self.read_pairs_examined_raw == 0
+            && self.secondary_or_supplementary_reads == 0
+            && self.unmapped_reads == 0
+            && self.unpaired_read_duplicates == 0
+            && self.read_pair_duplicates_raw == 0
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -138,7 +154,6 @@ fn validate_args(args: &Args) -> Result<()> {
 fn mark_duplicates(args: &Args) -> Result<()> {
     create_parent_dir(&args.output_bam)?;
     create_parent_dir(&args.output_metrics)?;
-
     let mut reader = bam::Reader::from_path(&args.input_bam)
         .with_context(|| format!("failed to open {}", args.input_bam.display()))?;
     if args.threads > 1 {
@@ -166,6 +181,15 @@ fn mark_duplicates(args: &Args) -> Result<()> {
     }
     let mut writer = bam::Writer::from_path(&args.output_bam, &output_header, bam::Format::Bam)
         .with_context(|| format!("failed to create {}", args.output_bam.display()))?;
+    writer
+        .set_compression_level(bam_compression_level(args.compression_level))
+        .with_context(|| {
+            format!(
+                "failed to set BAM compression level {} for {}",
+                args.compression_level,
+                args.output_bam.display()
+            )
+        })?;
     if args.threads > 1 {
         writer.set_threads(args.threads).with_context(|| {
             format!(
@@ -195,7 +219,7 @@ fn mark_duplicates(args: &Args) -> Result<()> {
     }
     drop(writer);
 
-    write_metrics(&args.output_metrics, &metrics_by_library)?;
+    write_metrics(&args.output_metrics, &header_libraries, &metrics_by_library)?;
     if args.create_index {
         index_bam(
             &args.samtools,
@@ -336,7 +360,7 @@ fn order_pair<'a>(
 }
 
 fn summarize_record(record: &bam::Record, header_libraries: &HeaderLibraries) -> ReadSummary {
-    let (_, library_id) = header_libraries.library_for_record(record);
+    let library_id = header_libraries.library_id_for_record(record);
     let cigar = record.cigar();
     ReadSummary {
         tid: record.tid(),
@@ -409,6 +433,8 @@ impl HeaderLibraries {
         let header_text = String::from_utf8_lossy(header.as_bytes());
         let mut by_read_group = HashMap::new();
         let mut library_ids = HashMap::new();
+        let mut library_names = Vec::new();
+        let mut declared_libraries = Vec::new();
         for line in header_text.lines().filter(|line| line.starts_with("@RG\t")) {
             let mut id: Option<Vec<u8>> = None;
             let mut library: Option<String> = None;
@@ -421,48 +447,63 @@ impl HeaderLibraries {
             }
             if let Some(id) = id {
                 let library = library.unwrap_or_else(|| UNKNOWN_LIBRARY.to_string());
-                by_read_group.insert(id, library.clone());
-                next_library_id(&mut library_ids, &library);
+                let library_id = next_library_id(
+                    &mut library_ids,
+                    &mut library_names,
+                    &mut declared_libraries,
+                    &library,
+                    true,
+                );
+                by_read_group.insert(id, library_id);
             }
         }
-        next_library_id(&mut library_ids, UNKNOWN_LIBRARY);
+        let unknown_library_id = next_library_id(
+            &mut library_ids,
+            &mut library_names,
+            &mut declared_libraries,
+            UNKNOWN_LIBRARY,
+            false,
+        );
         Self {
             by_read_group,
-            library_ids,
+            library_names,
+            declared_libraries,
+            unknown_library_id,
         }
     }
 
-    fn library_for_record(&self, record: &bam::Record) -> (String, u16) {
-        let library = match record.aux(b"RG") {
-            Ok(Aux::String(read_group)) => self
+    fn library_id_for_record(&self, record: &bam::Record) -> u16 {
+        match record.aux(b"RG") {
+            Ok(Aux::String(read_group)) => *self
                 .by_read_group
                 .get(read_group.as_bytes())
-                .cloned()
-                .unwrap_or_else(|| UNKNOWN_LIBRARY.to_string()),
-            _ => UNKNOWN_LIBRARY.to_string(),
-        };
-        let library_id = *self
-            .library_ids
-            .get(&library)
-            .or_else(|| self.library_ids.get(UNKNOWN_LIBRARY))
-            .unwrap_or(&0);
-        (library, library_id)
+                .unwrap_or(&self.unknown_library_id),
+            _ => self.unknown_library_id,
+        }
     }
 
-    fn empty_metrics_by_library(&self) -> BTreeMap<String, Metrics> {
-        self.by_read_group
-            .values()
-            .map(|library| (library.clone(), Metrics::default()))
-            .collect()
+    fn empty_metrics_by_library(&self) -> Vec<Metrics> {
+        vec![Metrics::default(); self.library_names.len()]
     }
 }
 
-fn next_library_id(library_ids: &mut HashMap<String, u16>, library: &str) -> u16 {
+fn next_library_id(
+    library_ids: &mut HashMap<String, u16>,
+    library_names: &mut Vec<String>,
+    declared_libraries: &mut Vec<bool>,
+    library: &str,
+    declared: bool,
+) -> u16 {
     if let Some(id) = library_ids.get(library) {
+        if declared {
+            declared_libraries[*id as usize] = true;
+        }
         return *id;
     }
-    let id = u16::try_from(library_ids.len()).unwrap_or(u16::MAX);
+    let id = u16::try_from(library_names.len()).unwrap_or(u16::MAX);
     library_ids.insert(library.to_string(), id);
+    library_names.push(library.to_string());
+    declared_libraries.push(declared);
     id
 }
 
@@ -477,12 +518,12 @@ fn output_header(input_header: &bam::HeaderView) -> bam::Header {
 }
 
 fn update_metrics(
-    metrics_by_library: &mut BTreeMap<String, Metrics>,
+    metrics_by_library: &mut [Metrics],
     header_libraries: &HeaderLibraries,
     record: &bam::Record,
 ) {
-    let (library, _) = header_libraries.library_for_record(record);
-    let metrics = metrics_by_library.entry(library).or_default();
+    let library_id = header_libraries.library_id_for_record(record) as usize;
+    let metrics = &mut metrics_by_library[library_id];
     let secondary_or_supplementary = record.is_secondary() || record.is_supplementary();
     let has_mapped_mate = record.is_paired() && !record.is_mate_unmapped();
 
@@ -505,7 +546,11 @@ fn update_metrics(
     }
 }
 
-fn write_metrics(path: &Path, metrics_by_library: &BTreeMap<String, Metrics>) -> Result<()> {
+fn write_metrics(
+    path: &Path,
+    header_libraries: &HeaderLibraries,
+    metrics_by_library: &[Metrics],
+) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
@@ -514,7 +559,11 @@ fn write_metrics(path: &Path, metrics_by_library: &BTreeMap<String, Metrics>) ->
         writer,
         "LIBRARY\tUNPAIRED_READS_EXAMINED\tREAD_PAIRS_EXAMINED\tSECONDARY_OR_SUPPLEMENTARY_RDS\tUNMAPPED_READS\tUNPAIRED_READ_DUPLICATES\tREAD_PAIR_DUPLICATES\tREAD_PAIR_OPTICAL_DUPLICATES\tPERCENT_DUPLICATION\tESTIMATED_LIBRARY_SIZE"
     )?;
-    for (library, metrics) in metrics_by_library {
+    for (library_id, metrics) in metrics_by_library.iter().enumerate() {
+        if !header_libraries.declared_libraries[library_id] && metrics.is_empty() {
+            continue;
+        }
+        let library = &header_libraries.library_names[library_id];
         let read_pairs_examined = metrics.read_pairs_examined_raw / 2;
         let read_pair_duplicates = metrics.read_pair_duplicates_raw / 2;
         let denominator = metrics.unpaired_reads_examined + 2 * read_pairs_examined;
@@ -617,6 +666,10 @@ fn create_parent_dir(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bam_compression_level(level: u32) -> bam::CompressionLevel {
+    bam::CompressionLevel::Level(level)
 }
 
 #[cfg(test)]

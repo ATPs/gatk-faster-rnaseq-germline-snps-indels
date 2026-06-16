@@ -28,3 +28,6 @@ use this RNA-seq data: /data1/xlab/researches/AML/Leucegene/raw/PRJNA214592/SRR9
 use this reference genome: /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.fasta
 gatk files in folder: /data1/pub/gatk/broad_hg38
 use up to 40 threads
+
+# rust
+build follow the build.md file. update this file if needed.

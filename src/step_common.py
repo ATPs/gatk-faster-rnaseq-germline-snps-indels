@@ -36,6 +36,7 @@ RUST_APPLY_BQSR = RUST_BIN_DIR / "rust_apply_bqsr"
 RUST_BASE_RECALIBRATOR = RUST_BIN_DIR / "rust_base_recalibrator"
 RUST_MARK_DUPLICATES = RUST_BIN_DIR / "rust_mark_duplicates"
 RUST_HC_PREFILTER = RUST_BIN_DIR / "rust_hc_prefilter"
+RUST_HAPLOTYPE_CALLER = RUST_BIN_DIR / "rust_haplotype_caller"
 
 
 def quote_cmd(command: list[str]) -> str:

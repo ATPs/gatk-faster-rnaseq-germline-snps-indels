@@ -240,6 +240,29 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of scattered HaplotypeCaller Java processes to run at once.",
     )
     parser.add_argument(
+        "--hc-backend",
+        choices=("gatk", "rust"),
+        default="gatk",
+        help="Backend for HaplotypeCaller. The Rust full caller is opt-in while it is under development.",
+    )
+    parser.add_argument(
+        "--rust-haplotype-caller",
+        type=Path,
+        help="Path to the rust_haplotype_caller binary when --hc-backend=rust.",
+    )
+    parser.add_argument(
+        "--hc-memory-gb",
+        type=int,
+        default=128,
+        help="Memory budget advertised to rust_haplotype_caller.",
+    )
+    parser.add_argument(
+        "--hc-pair-hmm-implementation",
+        choices=("rust", "native"),
+        default="native",
+        help="PairHMM implementation requested from rust_haplotype_caller.",
+    )
+    parser.add_argument(
         "--hc-prefilter-backend",
         choices=("auto", "none", "rust"),
         default="auto",
@@ -280,6 +303,7 @@ def main() -> int:
     args.rust_base_recalibrator = args.rust_base_recalibrator or default_rust_binary(args.rust_bin_dir, "rust_base_recalibrator")
     args.rust_apply_bqsr = args.rust_apply_bqsr or default_rust_binary(args.rust_bin_dir, "rust_apply_bqsr")
     args.rust_hc_prefilter = args.rust_hc_prefilter or default_rust_binary(args.rust_bin_dir, "rust_hc_prefilter")
+    args.rust_haplotype_caller = args.rust_haplotype_caller or default_rust_binary(args.rust_bin_dir, "rust_haplotype_caller")
     rust_mark_duplicates = default_rust_binary(args.rust_bin_dir, "rust_mark_duplicates")
 
     if args.no_rust:
@@ -288,6 +312,7 @@ def main() -> int:
         args.base_recalibrator_backend = "gatk"
         args.apply_bqsr_backend = "gatk"
         args.hc_prefilter_backend = "none"
+        args.hc_backend = "gatk"
         if args.mode == "auto":
             args.mode = "baseline"
     else:
@@ -326,6 +351,10 @@ def main() -> int:
         raise SystemExit("--hc-prefilter-padding must be non-negative.")
     if args.hc_prefilter_max_depth < 1:
         raise SystemExit("--hc-prefilter-max-depth must be at least 1.")
+    if args.hc_memory_gb < 1:
+        raise SystemExit("--hc-memory-gb must be at least 1.")
+    if args.hc_backend == "rust" and not args.rust_haplotype_caller.exists():
+        raise SystemExit(f"rust_haplotype_caller binary not found: {args.rust_haplotype_caller}")
 
     run_label = args.mode
     if args.interval_policy != "raw" or args.hc_scatter_count != 1:
@@ -340,6 +369,8 @@ def main() -> int:
         run_label = f"{run_label}.applybqsr-{args.apply_bqsr_backend}"
     if args.hc_prefilter_backend != "none":
         run_label = f"{run_label}.hcpf-{args.hc_prefilter_backend}"
+    if args.hc_backend != "gatk":
+        run_label = f"{run_label}.hc-{args.hc_backend}"
     outdir = args.outdir / run_label
     logs = outdir / "logs"
     refwork = outdir / "reference"
@@ -693,29 +724,47 @@ def main() -> int:
     if pair_hmm_threads is None:
         pair_hmm_threads = min(8, max(1, args.threads // args.hc_scatter_count))
 
-    hc_scatter_step: Step | None = None
-    hc_shard_steps: list[Step] = []
-    hc_merge_step: Step | None = None
-
-    if args.hc_scatter_count == 1:
-        hc_cmd = python_step_cmd(
+    def haplotype_caller_step_command(interval: Path, output_vcf: Path) -> list[str]:
+        return python_step_cmd(
             "step_haplotype_caller.py",
             "--ref",
             args.ref,
             "--input-bam",
             calling_bam,
             "--input-interval-list",
-            interval_list,
+            interval,
             "--output-vcf",
-            raw_vcf,
+            output_vcf,
+            "--backend",
+            args.hc_backend,
+            "--rust-bin",
+            args.rust_haplotype_caller,
+            "--threads",
+            str(args.threads),
+            "--memory-gb",
+            str(args.hc_memory_gb),
             "--pair-hmm-threads",
             str(pair_hmm_threads),
+            "--pair-hmm-implementation",
+            args.hc_pair_hmm_implementation,
             "--java-mem",
             args.java_mem,
             "--dbsnp",
             args.dbsnp,
         )
-        steps.append(Step("haplotype_caller", hc_cmd, (raw_vcf, Path(f"{raw_vcf}.tbi"))))
+
+    hc_scatter_step: Step | None = None
+    hc_shard_steps: list[Step] = []
+    hc_merge_step: Step | None = None
+
+    if args.hc_scatter_count == 1:
+        steps.append(
+            Step(
+                "haplotype_caller",
+                haplotype_caller_step_command(interval_list, raw_vcf),
+                (raw_vcf, Path(f"{raw_vcf}.tbi")),
+            )
+        )
     else:
         first_scatter_output = hc_scatter_dir / "0000-scattered.interval_list"
         hc_scatter_step = Step(
@@ -782,23 +831,7 @@ def main() -> int:
             hc_shard_steps.append(
                 Step(
                     f"haplotype_caller_shard_{shard_index:04d}",
-                    python_step_cmd(
-                        "step_haplotype_caller.py",
-                        "--ref",
-                        args.ref,
-                        "--input-bam",
-                        calling_bam,
-                        "--input-interval-list",
-                        shard_interval,
-                        "--output-vcf",
-                        shard_vcf,
-                        "--pair-hmm-threads",
-                        str(pair_hmm_threads),
-                        "--java-mem",
-                        args.java_mem,
-                        "--dbsnp",
-                        args.dbsnp,
-                    ),
+                    haplotype_caller_step_command(shard_interval, shard_vcf),
                     (shard_vcf, Path(f"{shard_vcf}.tbi")),
                 )
             )

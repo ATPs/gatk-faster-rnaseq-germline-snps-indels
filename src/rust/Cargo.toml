@@ -12,6 +12,10 @@ name = "rust_hc_prefilter"
 path = "src/bin/rust_hc_prefilter.rs"
 
 [[bin]]
+name = "rust_haplotype_caller"
+path = "src/bin/rust_haplotype_caller.rs"
+
+[[bin]]
 name = "rust_base_recalibrator"
 path = "src/bin/rust_base_recalibrator.rs"
 
