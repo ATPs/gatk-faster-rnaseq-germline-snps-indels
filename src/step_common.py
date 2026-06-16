@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_FASTQ_DIR = Path("/data1/xlab/researches/AML/Leucegene/raw/PRJNA214592/SRR949115")
 DEFAULT_GATK_RESOURCES = Path("/data1/pub/gatk/broad_hg38")
 DEFAULT_REF = DEFAULT_GATK_RESOURCES / "Homo_sapiens_assembly38.fasta"
@@ -28,6 +29,13 @@ GATK = Path("/data/p/gatk/gatk-4.6.2.0/gatk")
 STAR = Path("/data/p/star/STAR_2.7.11b/Linux_x86_64_static/STAR")
 SAMTOOLS = Path("/data/p/samtools/samtools-1.22.1_installed/bin/samtools")
 SAMBAMBA = Path("/data/p/tools/sambamba/bin/sambamba-1.0.1")
+RUST_BIN_DIR = SCRIPT_DIR / "rust" / "bin"
+RUST_INTERVAL_TOOLS = RUST_BIN_DIR / "rust_interval_tools"
+RUST_SPLIT_N_CIGAR_READS = RUST_BIN_DIR / "rust_split_n_cigar_reads"
+RUST_APPLY_BQSR = RUST_BIN_DIR / "rust_apply_bqsr"
+RUST_BASE_RECALIBRATOR = RUST_BIN_DIR / "rust_base_recalibrator"
+RUST_MARK_DUPLICATES = RUST_BIN_DIR / "rust_mark_duplicates"
+RUST_HC_PREFILTER = RUST_BIN_DIR / "rust_hc_prefilter"
 
 
 def quote_cmd(command: list[str]) -> str:
@@ -37,6 +45,12 @@ def quote_cmd(command: list[str]) -> str:
 def run_command(command: list[str]) -> None:
     print(f"$ {quote_cmd(command)}", flush=True)
     subprocess.run(command, check=True)
+
+
+def resolve_rust_binary(explicit_path: Path | None, default_path: Path) -> Path:
+    if explicit_path is not None:
+        return Path(explicit_path)
+    return default_path
 
 
 def existing(path: Path) -> Path:

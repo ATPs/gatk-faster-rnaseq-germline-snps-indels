@@ -1,0 +1,37 @@
+[package]
+name = "gatk-faster-rnaseq-rust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust_apply_bqsr"
+path = "src/bin/rust_apply_bqsr.rs"
+
+[[bin]]
+name = "rust_hc_prefilter"
+path = "src/bin/rust_hc_prefilter.rs"
+
+[[bin]]
+name = "rust_base_recalibrator"
+path = "src/bin/rust_base_recalibrator.rs"
+
+[[bin]]
+name = "rust_mark_duplicates"
+path = "src/bin/rust_mark_duplicates.rs"
+
+[[bin]]
+name = "rust_split_n_cigar_reads"
+path = "src/bin/rust_split_n_cigar_reads.rs"
+
+[[bin]]
+name = "rust_interval_tools"
+path = "src/bin/rust_interval_tools.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+rust-htslib = { version = "1.0.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.10"

@@ -32,6 +32,7 @@ DEFAULT_KNOWN_SITES = [
 GATK = Path("/data/p/gatk/gatk-4.6.2.0/gatk")
 SAMTOOLS = Path("/data/p/samtools/samtools-1.22.1_installed/bin/samtools")
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_RUST_BIN_DIR = SCRIPT_DIR / "rust" / "bin"
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,10 @@ def existing(path: Path) -> Path:
     return path
 
 
+def default_rust_binary(bin_dir: Path, name: str) -> Path:
+    return bin_dir / name
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a timed GATK RNA-seq germline SNP/indel pipeline."
@@ -136,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fastq2", type=existing, default=DEFAULT_FASTQ_DIR / "SRR949115_2.fastq.gz")
     parser.add_argument("--aligned-bam", type=existing, help="Use an existing STAR coordinate-sorted BAM.")
     parser.add_argument("--outdir", type=Path, default=Path("/XCLabServer002_fastIO/gatk-faster-rnaseq/SRR949115"))
-    parser.add_argument("--mode", choices=("baseline", "sambamba"), default="baseline")
+    parser.add_argument("--mode", choices=("auto", "baseline", "sambamba", "rust"), default="auto")
     parser.add_argument("--threads", type=int, default=40)
     parser.add_argument("--ref", type=existing, default=DEFAULT_REF)
     parser.add_argument("--ref-dict", type=existing, default=DEFAULT_REF_DICT)
@@ -149,6 +154,73 @@ def parse_args() -> argparse.Namespace:
         choices=("raw", "merged"),
         default="raw",
         help="Use raw exon intervals or merged non-overlapping exon intervals for HaplotypeCaller.",
+    )
+    parser.add_argument(
+        "--rust-bin-dir",
+        type=Path,
+        default=DEFAULT_RUST_BIN_DIR,
+        help="Directory containing release Rust pipeline binaries.",
+    )
+    parser.add_argument(
+        "--no-rust",
+        action="store_true",
+        help="Disable all Rust backends and force the GATK/non-Rust path.",
+    )
+    parser.add_argument(
+        "--interval-backend",
+        choices=("auto", "gatk", "rust"),
+        default="auto",
+        help="Backend for BED to interval_list conversion and HaplotypeCaller interval splitting.",
+    )
+    parser.add_argument(
+        "--rust-interval-tools",
+        type=Path,
+        help="Path to the rust_interval_tools binary when --interval-backend=rust.",
+    )
+    parser.add_argument(
+        "--split-n-cigar-backend",
+        choices=("auto", "gatk", "rust"),
+        default="auto",
+        help="Backend for SplitNCigarReads.",
+    )
+    parser.add_argument(
+        "--rust-split-n-cigar",
+        type=Path,
+        help="Path to the rust_split_n_cigar_reads binary when --split-n-cigar-backend=rust.",
+    )
+    parser.add_argument(
+        "--split-n-cigar-rust-mode",
+        choices=("fast", "compatibility"),
+        default="fast",
+        help="Rust SplitNCigarReads mode. Fast mode is validated for speed-first use; compatibility mode repairs more tags.",
+    )
+    parser.add_argument(
+        "--base-recalibrator-backend",
+        choices=("auto", "gatk", "rust"),
+        default="auto",
+        help="Backend for BaseRecalibrator.",
+    )
+    parser.add_argument(
+        "--rust-base-recalibrator",
+        type=Path,
+        help="Path to the rust_base_recalibrator binary when --base-recalibrator-backend=rust.",
+    )
+    parser.add_argument(
+        "--base-recalibrator-region-bases",
+        type=int,
+        default=25_000_000,
+        help="Genomic region size used by the Rust BaseRecalibrator work queue.",
+    )
+    parser.add_argument(
+        "--apply-bqsr-backend",
+        choices=("auto", "gatk", "rust"),
+        default="auto",
+        help="Backend for ApplyBQSR.",
+    )
+    parser.add_argument(
+        "--rust-apply-bqsr",
+        type=Path,
+        help="Path to the rust_apply_bqsr binary when --apply-bqsr-backend=rust.",
     )
     parser.add_argument(
         "--hc-scatter-count",
@@ -167,6 +239,26 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Maximum number of scattered HaplotypeCaller Java processes to run at once.",
     )
+    parser.add_argument(
+        "--hc-prefilter-backend",
+        choices=("auto", "none", "rust"),
+        default="auto",
+        help="Optionally prefilter HaplotypeCaller intervals before calling.",
+    )
+    parser.add_argument(
+        "--rust-hc-prefilter",
+        type=Path,
+        help="Path to the rust_hc_prefilter binary when --hc-prefilter-backend=rust.",
+    )
+    parser.add_argument("--hc-prefilter-min-mapq", type=int, default=20)
+    parser.add_argument("--hc-prefilter-min-baseq", type=int, default=10)
+    parser.add_argument("--hc-prefilter-min-alt-count", type=int, default=1)
+    parser.add_argument("--hc-prefilter-min-indel-count", type=int, default=1)
+    parser.add_argument("--hc-prefilter-min-alt-fraction", type=float, default=0.0)
+    parser.add_argument("--hc-prefilter-padding", type=int, default=150)
+    parser.add_argument("--hc-prefilter-max-depth", type=int, default=100000)
+    parser.add_argument("--hc-prefilter-exclude-supplementary", action="store_true")
+    parser.add_argument("--hc-prefilter-empty-behavior", choices=("error", "input"), default="input")
     parser.add_argument("--skip-bqsr", action="store_true", help="Allow a run without known-sites resources.")
     parser.add_argument("--java-mem", default="24g")
     parser.add_argument("--force", action="store_true", help="Rerun steps even if outputs already exist.")
@@ -183,6 +275,35 @@ def python_step_cmd(script_name: str, *args: str | Path) -> list[str]:
 
 def main() -> int:
     args = parse_args()
+    args.rust_interval_tools = args.rust_interval_tools or default_rust_binary(args.rust_bin_dir, "rust_interval_tools")
+    args.rust_split_n_cigar = args.rust_split_n_cigar or default_rust_binary(args.rust_bin_dir, "rust_split_n_cigar_reads")
+    args.rust_base_recalibrator = args.rust_base_recalibrator or default_rust_binary(args.rust_bin_dir, "rust_base_recalibrator")
+    args.rust_apply_bqsr = args.rust_apply_bqsr or default_rust_binary(args.rust_bin_dir, "rust_apply_bqsr")
+    args.rust_hc_prefilter = args.rust_hc_prefilter or default_rust_binary(args.rust_bin_dir, "rust_hc_prefilter")
+    rust_mark_duplicates = default_rust_binary(args.rust_bin_dir, "rust_mark_duplicates")
+
+    if args.no_rust:
+        args.interval_backend = "gatk"
+        args.split_n_cigar_backend = "gatk"
+        args.base_recalibrator_backend = "gatk"
+        args.apply_bqsr_backend = "gatk"
+        args.hc_prefilter_backend = "none"
+        if args.mode == "auto":
+            args.mode = "baseline"
+    else:
+        if args.interval_backend == "auto":
+            args.interval_backend = "rust" if args.rust_interval_tools.exists() else "gatk"
+        if args.split_n_cigar_backend == "auto":
+            args.split_n_cigar_backend = "rust" if args.rust_split_n_cigar.exists() else "gatk"
+        if args.base_recalibrator_backend == "auto":
+            args.base_recalibrator_backend = "rust" if args.rust_base_recalibrator.exists() else "gatk"
+        if args.apply_bqsr_backend == "auto":
+            args.apply_bqsr_backend = "rust" if args.rust_apply_bqsr.exists() else "gatk"
+        if args.hc_prefilter_backend == "auto":
+            args.hc_prefilter_backend = "rust" if args.rust_hc_prefilter.exists() else "none"
+        if args.mode == "auto":
+            args.mode = "rust" if rust_mark_duplicates.exists() else "baseline"
+
     if args.known_sites is None:
         args.known_sites = [path for path in DEFAULT_KNOWN_SITES if path.exists()]
     if not args.skip_bqsr and not args.known_sites:
@@ -193,10 +314,32 @@ def main() -> int:
         raise SystemExit("--hc-threads-per-shard must be at least 1.")
     if args.hc_parallel_jobs < 1:
         raise SystemExit("--hc-parallel-jobs must be at least 1.")
+    if args.base_recalibrator_region_bases < 1:
+        raise SystemExit("--base-recalibrator-region-bases must be at least 1.")
+    if args.hc_prefilter_min_mapq < 0 or args.hc_prefilter_min_baseq < 0:
+        raise SystemExit("--hc-prefilter-min-mapq and --hc-prefilter-min-baseq must be non-negative.")
+    if args.hc_prefilter_min_alt_count < 1 or args.hc_prefilter_min_indel_count < 1:
+        raise SystemExit("--hc-prefilter-min-alt-count and --hc-prefilter-min-indel-count must be at least 1.")
+    if not 0.0 <= args.hc_prefilter_min_alt_fraction <= 1.0:
+        raise SystemExit("--hc-prefilter-min-alt-fraction must be between 0 and 1.")
+    if args.hc_prefilter_padding < 0:
+        raise SystemExit("--hc-prefilter-padding must be non-negative.")
+    if args.hc_prefilter_max_depth < 1:
+        raise SystemExit("--hc-prefilter-max-depth must be at least 1.")
 
     run_label = args.mode
     if args.interval_policy != "raw" or args.hc_scatter_count != 1:
         run_label = f"{args.mode}.{args.interval_policy}.hcscatter{args.hc_scatter_count}"
+    if args.interval_backend != "gatk":
+        run_label = f"{run_label}.intervals-{args.interval_backend}"
+    if args.split_n_cigar_backend != "gatk":
+        run_label = f"{run_label}.splitncigar-{args.split_n_cigar_backend}"
+    if args.base_recalibrator_backend != "gatk":
+        run_label = f"{run_label}.baserecal-{args.base_recalibrator_backend}"
+    if args.apply_bqsr_backend != "gatk":
+        run_label = f"{run_label}.applybqsr-{args.apply_bqsr_backend}"
+    if args.hc_prefilter_backend != "none":
+        run_label = f"{run_label}.hcpf-{args.hc_prefilter_backend}"
     outdir = args.outdir / run_label
     logs = outdir / "logs"
     refwork = outdir / "reference"
@@ -222,6 +365,9 @@ def main() -> int:
     merged_exon_bed = refwork / "exons.merged.bed"
     raw_interval_list = refwork / "exons.interval_list"
     merged_interval_list = refwork / "exons.merged.interval_list"
+    hc_prefilter_interval_list = refwork / "hc_candidate.interval_list"
+    hc_prefilter_bed = refwork / "hc_candidate.bed"
+    hc_prefilter_summary = outdir / f"{sample}.hc_prefilter.summary.tsv"
     dict_path = args.ref_dict
 
     fai_path = Path(f"{args.ref}.fai")
@@ -269,6 +415,10 @@ def main() -> int:
                 args.java_mem,
                 "--output-interval-list",
                 raw_interval_list,
+                "--backend",
+                args.interval_backend,
+                "--rust-bin",
+                args.rust_interval_tools,
             ),
             (raw_interval_list,),
         )
@@ -301,6 +451,10 @@ def main() -> int:
                     args.java_mem,
                     "--output-interval-list",
                     merged_interval_list,
+                    "--backend",
+                    args.interval_backend,
+                    "--rust-bin",
+                    args.rust_interval_tools,
                 ),
                 (merged_interval_list,),
             )
@@ -351,11 +505,13 @@ def main() -> int:
                     args.java_mem,
                     "--tmpdir",
                     outdir / "sambamba_tmp",
+                    "--rust-bin",
+                    rust_mark_duplicates,
                 ),
                 (dedup_bam, bam_index_path(dedup_bam)),
             )
         )
-    else:
+    elif args.mode == "sambamba":
         steps.append(
             Step(
                 "mark_duplicates_sambamba",
@@ -375,6 +531,34 @@ def main() -> int:
                     args.java_mem,
                     "--tmpdir",
                     outdir / "sambamba_tmp",
+                    "--rust-bin",
+                    rust_mark_duplicates,
+                ),
+                (dedup_bam, bam_index_path(dedup_bam)),
+            )
+        )
+    else:
+        steps.append(
+            Step(
+                "mark_duplicates_rust",
+                python_step_cmd(
+                    "step_mark_duplicates.py",
+                    "--mode",
+                    args.mode,
+                    "--input-bam",
+                    aligned_bam,
+                    "--output-bam",
+                    dedup_bam,
+                    "--output-metrics",
+                    markdup_metrics,
+                    "--threads",
+                    str(args.threads),
+                    "--java-mem",
+                    args.java_mem,
+                    "--tmpdir",
+                    outdir / "sambamba_tmp",
+                    "--rust-bin",
+                    rust_mark_duplicates,
                 ),
                 (dedup_bam, bam_index_path(dedup_bam)),
             )
@@ -393,8 +577,16 @@ def main() -> int:
                 split_bam,
                 "--java-mem",
                 args.java_mem,
+                "--backend",
+                args.split_n_cigar_backend,
+                "--rust-bin",
+                args.rust_split_n_cigar,
+                "--threads",
+                str(args.threads),
+                "--rust-mode",
+                args.split_n_cigar_rust_mode,
             ),
-            (split_bam,),
+            (split_bam, bam_index_path(split_bam)),
         )
     )
 
@@ -411,6 +603,14 @@ def main() -> int:
             recal_table,
             "--java-mem",
             args.java_mem,
+            "--backend",
+            args.base_recalibrator_backend,
+            "--rust-bin",
+            args.rust_base_recalibrator,
+            "--threads",
+            str(args.threads),
+            "--region-bases",
+            str(args.base_recalibrator_region_bases),
         )
         for known in args.known_sites:
             bqsr_cmd.extend(["--known-sites", str(known)])
@@ -430,12 +630,65 @@ def main() -> int:
                     calling_bam,
                     "--java-mem",
                     args.java_mem,
+                    "--backend",
+                    args.apply_bqsr_backend,
+                    "--rust-bin",
+                    args.rust_apply_bqsr,
+                    "--threads",
+                    str(args.threads),
                 ),
-                (calling_bam,),
+                (calling_bam, bam_index_path(calling_bam)),
             )
         )
 
     interval_list = merged_interval_list if args.interval_policy == "merged" else raw_interval_list
+    if args.hc_prefilter_backend == "rust":
+        hc_prefilter_cmd = python_step_cmd(
+            "step_hc_prefilter.py",
+            "--ref",
+            args.ref,
+            "--input-bam",
+            calling_bam,
+            "--input-interval-list",
+            interval_list,
+            "--output-interval-list",
+            hc_prefilter_interval_list,
+            "--output-summary",
+            hc_prefilter_summary,
+            "--output-bed",
+            hc_prefilter_bed,
+            "--min-mapq",
+            str(args.hc_prefilter_min_mapq),
+            "--min-baseq",
+            str(args.hc_prefilter_min_baseq),
+            "--min-alt-count",
+            str(args.hc_prefilter_min_alt_count),
+            "--min-indel-count",
+            str(args.hc_prefilter_min_indel_count),
+            "--min-alt-fraction",
+            str(args.hc_prefilter_min_alt_fraction),
+            "--padding",
+            str(args.hc_prefilter_padding),
+            "--max-depth",
+            str(args.hc_prefilter_max_depth),
+            "--threads",
+            str(args.threads),
+            "--empty-behavior",
+            args.hc_prefilter_empty_behavior,
+            "--rust-bin",
+            args.rust_hc_prefilter,
+        )
+        if args.hc_prefilter_exclude_supplementary:
+            hc_prefilter_cmd.append("--exclude-supplementary")
+        steps.append(
+            Step(
+                "hc_candidate_prefilter",
+                hc_prefilter_cmd,
+                (hc_prefilter_interval_list, hc_prefilter_summary, hc_prefilter_bed),
+            )
+        )
+        interval_list = hc_prefilter_interval_list
+
     pair_hmm_threads = args.hc_threads_per_shard
     if pair_hmm_threads is None:
         pair_hmm_threads = min(8, max(1, args.threads // args.hc_scatter_count))
@@ -479,6 +732,10 @@ def main() -> int:
                 hc_scatter_dir,
                 "--java-mem",
                 args.java_mem,
+                "--backend",
+                args.interval_backend,
+                "--rust-bin",
+                args.rust_interval_tools,
             ),
             (first_scatter_output,),
         )

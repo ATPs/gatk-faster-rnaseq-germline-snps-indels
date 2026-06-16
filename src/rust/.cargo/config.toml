@@ -1,0 +1,4 @@
+[env]
+LIBCLANG_PATH = "/data/p/anaconda3/lib"
+LD_LIBRARY_PATH = "/data/p/anaconda3/lib"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/data/p/anaconda3/x86_64-conda-linux-gnu/sysroot -I/data/p/anaconda3/lib/gcc/x86_64-conda-linux-gnu/13.2.0/include"
