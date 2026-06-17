@@ -28,6 +28,8 @@ const HALF_DEFAULT_PCR_SNV_QUAL: u8 = 20;
 const FISHER_STRAND_TARGET_TABLE_SIZE: f64 = 200.0;
 const FISHER_STRAND_MIN_PVALUE: f64 = 1e-320;
 const CALL_PARTITIONS_PER_THREAD: usize = 8;
+const ACTIVE_REGION_MAX_GAP: u64 = 50;
+const ACTIVE_REGION_PADDING: u64 = 50;
 
 // GATK's isActive() uses a minimal confidence threshold of 4.0 for
 // active-region discovery, much lower than the standard calling threshold.
@@ -72,6 +74,30 @@ pub struct HaplotypeReplayStats {
 /// MinimalGenotypingEngine.calculateSingleSampleRefVsAnyActiveStateProfileValue.
 ///
 /// Returns true if the locus is "active" — i.e., likely to harbor variation.
+
+fn is_active_indel(evidence: &IndelEvidence) -> bool {
+    if evidence.counts.depth < 2 {
+        return false;
+    }
+    let mut log10_likelihoods = [0.0_f64; 3];
+    for observation in &evidence.observations {
+        let error = phred_error_probability(observation.quality);
+        let is_ref = matches!(observation.allele, IndelObservationAllele::Ref);
+        let ref_prob = snp_observation_probability(is_ref, error);
+        let alt_prob = if !is_ref {
+            1.0 - error
+        } else {
+            error / 3.0
+        }
+        .max(f64::MIN_POSITIVE);
+        add_diploid_observation(&mut log10_likelihoods, ref_prob, alt_prob);
+    }
+    let denominator = log10_sum_exp(&log10_likelihoods);
+    let ref_posterior_log10 = log10_likelihoods[0] - denominator;
+    let qual = phred_from_log10_probability(ref_posterior_log10);
+    f64::from(qual) >= ACTIVE_REGION_DISCOVERY_CONFIDENCE
+}
+
 fn is_active_locus(ref_index: Option<usize>, evidence: &SnpEvidence, depth: u32) -> bool {
     let ref_index = match ref_index {
         Some(idx) => idx,
@@ -680,6 +706,107 @@ fn scan_replay_partition(
     Ok(output)
 }
 
+
+fn discover_active_regions(
+    config: &HaplotypeCallerConfig,
+    tid: u32,
+    window: &FetchWindow,
+    ref_bases: &[u8],
+    bam: &mut bam::IndexedReader,
+) -> Result<Vec<Interval>> {
+    let mut active_regions: Vec<Interval> = Vec::new();
+    bam.fetch((tid as i32, (window.start - 1) as i64, window.end as i64))
+        .with_context(|| {
+            format!(
+                "fetching BAM region {}:{}-{} for active region discovery",
+                window.contig, window.start, window.end
+            )
+        })?;
+    let mut pileups = bam.pileup();
+    pileups.set_max_depth(PIPELINE_MAX_DEPTH);
+    let mut interval_cursor = 0_usize;
+    let mut current_region: Option<Interval> = None;
+
+    for pileup in pileups {
+        let pileup = pileup.with_context(|| {
+            format!(
+                "reading pileup for {}:{}-{} active discovery",
+                window.contig, window.start, window.end
+            )
+        })?;
+        if pileup.tid() != tid {
+            continue;
+        }
+        let pos0 = u64::from(pileup.pos());
+        if pos0 < window.start - 1 || pos0 >= window.end {
+            continue;
+        }
+        let pos1 = pos0 + 1;
+        if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
+            continue;
+        }
+
+        let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
+        let snp_evidence = pileup_snp_evidence(
+            &pileup,
+            PIPELINE_MIN_BASEQ,
+            PIPELINE_MIN_MAPQ,
+            PIPELINE_MIN_TAIL_QUALITY,
+            config.dont_use_soft_clipped_bases,
+        );
+        let indel_evidence = pileup_indel_evidence(
+            &pileup,
+            PIPELINE_MIN_BASEQ,
+            PIPELINE_MIN_MAPQ,
+            PIPELINE_MIN_TAIL_QUALITY,
+            config.dont_use_soft_clipped_bases,
+        );
+        let depth = snp_evidence.counts.depth.max(indel_evidence.counts.depth);
+
+        if is_active_locus(base_index(ref_base), &snp_evidence, depth) || is_active_indel(&indel_evidence) {
+            if let Some(ref mut reg) = current_region {
+                if pos1 <= reg.end + ACTIVE_REGION_MAX_GAP {
+                    reg.end = pos1;
+                } else {
+                    active_regions.push(reg.clone());
+                    *reg = Interval {
+                        contig: window.contig.clone(),
+                        start: pos1,
+                        end: pos1,
+                    };
+                }
+            } else {
+                current_region = Some(Interval {
+                    contig: window.contig.clone(),
+                    start: pos1,
+                    end: pos1,
+                });
+            }
+        }
+    }
+    if let Some(reg) = current_region {
+        active_regions.push(reg);
+    }
+
+    let mut coalesced: Vec<Interval> = Vec::new();
+    for mut reg in active_regions {
+        reg.start = reg.start.saturating_sub(ACTIVE_REGION_PADDING).max(window.start);
+        reg.end = reg.end.saturating_add(ACTIVE_REGION_PADDING).min(window.end);
+
+        if let Some(last) = coalesced.last_mut() {
+            if reg.start <= last.end + 1 {
+                last.end = last.end.max(reg.end);
+            } else {
+                coalesced.push(reg);
+            }
+        } else {
+            coalesced.push(reg);
+        }
+    }
+
+    Ok(coalesced)
+}
+
 fn scan_call_window(
     config: &HaplotypeCallerConfig,
     bam_tid_by_name: &HashMap<String, u32>,
@@ -730,67 +857,71 @@ fn scan_call_window(
             )
         })?;
 
-    bam.fetch((tid as i32, (window.start - 1) as i64, window.end as i64))
-        .with_context(|| {
-            format!(
-                "fetching BAM region {}:{}-{}",
-                window.contig, window.start, window.end
-            )
-        })?;
+    let active_regions = discover_active_regions(config, tid, window, &ref_bases, bam)?;
 
-    let mut pileups = bam.pileup();
-    pileups.set_max_depth(PIPELINE_MAX_DEPTH);
     let mut interval_cursor = 0_usize;
-    for pileup in pileups {
-        let pileup = pileup.with_context(|| {
-            format!(
-                "reading pileup for {}:{}-{}",
-                window.contig, window.start, window.end
-            )
-        })?;
-        if pileup.tid() != tid {
-            continue;
-        }
-        let pos0 = u64::from(pileup.pos());
-        if pos0 < window.start - 1 || pos0 >= window.end {
-            continue;
-        }
-        let pos1 = pos0 + 1;
-        if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
-            continue;
-        }
+    for region in active_regions {
+        bam.fetch((tid as i32, (region.start - 1) as i64, region.end as i64))
+            .with_context(|| {
+                format!(
+                    "fetching BAM region {}:{}-{}",
+                    region.contig, region.start, region.end
+                )
+            })?;
 
-        let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
-        if let Some(call) = best_snp_call(
-            &window.contig,
-            pos1,
-            ref_base,
-            pileup_snp_evidence(
-                &pileup,
-                PIPELINE_MIN_BASEQ,
-                PIPELINE_MIN_MAPQ,
-                PIPELINE_MIN_TAIL_QUALITY,
-                config.dont_use_soft_clipped_bases,
-            ),
-            config.standard_min_confidence_threshold_for_calling,
-        ) {
-            output.variants.push(call);
-        }
-        if let Some(call) = best_indel_call(
-            &window.contig,
-            pos1,
-            window.start,
-            &ref_bases,
-            pileup_indel_evidence(
-                &pileup,
-                PIPELINE_MIN_BASEQ,
-                PIPELINE_MIN_MAPQ,
-                PIPELINE_MIN_TAIL_QUALITY,
-                config.dont_use_soft_clipped_bases,
-            ),
-            config.standard_min_confidence_threshold_for_calling,
-        ) {
-            output.variants.push(call);
+        let mut pileups = bam.pileup();
+        pileups.set_max_depth(PIPELINE_MAX_DEPTH);
+        for pileup in pileups {
+            let pileup = pileup.with_context(|| {
+                format!(
+                    "reading pileup for {}:{}-{}",
+                    region.contig, region.start, region.end
+                )
+            })?;
+            if pileup.tid() != tid {
+                continue;
+            }
+            let pos0 = u64::from(pileup.pos());
+            if pos0 < region.start - 1 || pos0 >= region.end {
+                continue;
+            }
+            let pos1 = pos0 + 1;
+            if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
+                continue;
+            }
+
+            let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
+            if let Some(call) = best_snp_call(
+                &region.contig,
+                pos1,
+                ref_base,
+                pileup_snp_evidence(
+                    &pileup,
+                    PIPELINE_MIN_BASEQ,
+                    PIPELINE_MIN_MAPQ,
+                    PIPELINE_MIN_TAIL_QUALITY,
+                    config.dont_use_soft_clipped_bases,
+                ),
+                config.standard_min_confidence_threshold_for_calling,
+            ) {
+                output.variants.push(call);
+            }
+            if let Some(call) = best_indel_call(
+                &region.contig,
+                pos1,
+                window.start,
+                &ref_bases,
+                pileup_indel_evidence(
+                    &pileup,
+                    PIPELINE_MIN_BASEQ,
+                    PIPELINE_MIN_MAPQ,
+                    PIPELINE_MIN_TAIL_QUALITY,
+                    config.dont_use_soft_clipped_bases,
+                ),
+                config.standard_min_confidence_threshold_for_calling,
+            ) {
+                output.variants.push(call);
+            }
         }
     }
     Ok(())
@@ -846,137 +977,141 @@ fn scan_replay_window(
             )
         })?;
 
-    bam.fetch((tid as i32, (window.start - 1) as i64, window.end as i64))
-        .with_context(|| {
-            format!(
-                "fetching BAM region {}:{}-{}",
-                window.contig, window.start, window.end
-            )
-        })?;
+    let active_regions = discover_active_regions(config, tid, window, &ref_bases, bam)?;
 
-    let region = region_name(&window.contig, window.start, window.end);
-    let mut active_region = ReplayActiveRegionRow {
-        contig: window.contig.clone(),
-        start: window.start,
-        end: window.end,
-        region: region.clone(),
-        ..ReplayActiveRegionRow::default()
-    };
-
-    let mut pileups = bam.pileup();
-    pileups.set_max_depth(PIPELINE_MAX_DEPTH);
     let mut interval_cursor = 0_usize;
-    for pileup in pileups {
-        let pileup = pileup.with_context(|| {
-            format!(
-                "reading pileup for {}:{}-{}",
-                window.contig, window.start, window.end
-            )
-        })?;
-        if pileup.tid() != tid {
-            continue;
-        }
-        let pos0 = u64::from(pileup.pos());
-        if pos0 < window.start - 1 || pos0 >= window.end {
-            continue;
-        }
-        let pos1 = pos0 + 1;
-        if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
-            continue;
-        }
+    for region_interval in active_regions {
+        bam.fetch((tid as i32, (region_interval.start - 1) as i64, region_interval.end as i64))
+            .with_context(|| {
+                format!(
+                    "fetching BAM region {}:{}-{}",
+                    region_interval.contig, region_interval.start, region_interval.end
+                )
+            })?;
 
-        let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
-        let row_context = ReplayRowContext {
-            region: &region,
-            pos: pos1,
+        let region = region_name(&region_interval.contig, region_interval.start, region_interval.end);
+        let mut active_region = ReplayActiveRegionRow {
+            contig: region_interval.contig.clone(),
+            start: region_interval.start,
+            end: region_interval.end,
+            region: region.clone(),
+            ..ReplayActiveRegionRow::default()
         };
-        let (snp_evidence, snp_rows) = pileup_snp_evidence_with_rows(
-            &pileup,
-            PIPELINE_MIN_BASEQ,
-            PIPELINE_MIN_MAPQ,
-            PIPELINE_MIN_TAIL_QUALITY,
-            config.dont_use_soft_clipped_bases,
-            Some(&row_context),
-        );
-        let (indel_evidence, indel_rows) = pileup_indel_evidence_with_rows(
-            &pileup,
-            PIPELINE_MIN_BASEQ,
-            PIPELINE_MIN_MAPQ,
-            PIPELINE_MIN_TAIL_QUALITY,
-            config.dont_use_soft_clipped_bases,
-            Some(&row_context),
-        );
-        output.read_observations.extend(snp_rows);
-        output.read_observations.extend(indel_rows);
 
-        let ref_index = base_index(ref_base);
-        let snp_alt = best_snp_alt(ref_index, &snp_evidence);
-        let indel_alt = best_indel_alt(&indel_evidence);
-        let snp_alt_count = snp_alt.map(|(_, count)| count).unwrap_or(0);
-        let indel_alt_count = indel_alt.map(|(_, count)| *count).unwrap_or(0);
-        let depth = snp_evidence.counts.depth.max(indel_evidence.counts.depth);
-        let best_alt_count = snp_alt_count.max(indel_alt_count);
-        let alt_fraction = if depth == 0 {
-            0.0
-        } else {
-            f64::from(best_alt_count) / f64::from(depth)
-        };
-        let is_active = is_active_locus(ref_index, &snp_evidence, depth);
-        active_region.observed_loci += 1;
-        active_region.max_alt_fraction = active_region.max_alt_fraction.max(alt_fraction);
-        active_region.mean_alt_fraction += alt_fraction;
+        let mut pileups = bam.pileup();
+        pileups.set_max_depth(PIPELINE_MAX_DEPTH);
+        for pileup in pileups {
+            let pileup = pileup.with_context(|| {
+                format!(
+                    "reading pileup for {}:{}-{}",
+                    region_interval.contig, region_interval.start, region_interval.end
+                )
+            })?;
+            if pileup.tid() != tid {
+                continue;
+            }
+            let pos0 = u64::from(pileup.pos());
+            if pos0 < region_interval.start - 1 || pos0 >= region_interval.end {
+                continue;
+            }
+            let pos1 = pos0 + 1;
+            if !position_is_requested(&window.intervals, pos1, &mut interval_cursor) {
+                continue;
+            }
 
-        if is_active {
-            active_region.active_loci += 1;
-            output.active_loci.push(ReplayActiveLocusRow {
-                contig: window.contig.clone(),
+            let ref_base = normalize_base(ref_bases[(pos0 - (window.start - 1)) as usize]);
+            let row_context = ReplayRowContext {
+                region: &region,
                 pos: pos1,
-                region: region.clone(),
-                ref_base,
-                depth,
-                snp_alt_count,
-                snp_best_alt: snp_alt
-                    .map(|(base_index, _)| base_from_index(base_index) as char)
-                    .map(|base| base.to_string())
-                    .unwrap_or_default(),
-                indel_alt_count,
-                indel_best_alt: indel_alt
-                    .as_ref()
-                    .map(|(allele, _)| indel_allele_label(allele))
-                    .unwrap_or_default(),
-                alt_fraction,
-                active_probability_proxy: is_active as u8 as f64,
-            });
-        }
+            };
+            let (snp_evidence, snp_rows) = pileup_snp_evidence_with_rows(
+                &pileup,
+                PIPELINE_MIN_BASEQ,
+                PIPELINE_MIN_MAPQ,
+                PIPELINE_MIN_TAIL_QUALITY,
+                config.dont_use_soft_clipped_bases,
+                Some(&row_context),
+            );
+            let (indel_evidence, indel_rows) = pileup_indel_evidence_with_rows(
+                &pileup,
+                PIPELINE_MIN_BASEQ,
+                PIPELINE_MIN_MAPQ,
+                PIPELINE_MIN_TAIL_QUALITY,
+                config.dont_use_soft_clipped_bases,
+                Some(&row_context),
+            );
+            output.read_observations.extend(snp_rows);
+            output.read_observations.extend(indel_rows);
 
-        if let Some(call) = best_snp_call(
-            &window.contig,
-            pos1,
-            ref_base,
-            snp_evidence,
-            config.standard_min_confidence_threshold_for_calling,
-        ) {
-            active_region.candidate_events += 1;
-            output.events.push(replay_event_row(&region, &call)?);
-            output.variants.push(call);
+            let ref_index = base_index(ref_base);
+            let snp_alt = best_snp_alt(ref_index, &snp_evidence);
+            let indel_alt = best_indel_alt(&indel_evidence);
+            let snp_alt_count = snp_alt.map(|(_, count)| count).unwrap_or(0);
+            let indel_alt_count = indel_alt.map(|(_, count)| *count).unwrap_or(0);
+            let depth = snp_evidence.counts.depth.max(indel_evidence.counts.depth);
+            let best_alt_count = snp_alt_count.max(indel_alt_count);
+            let alt_fraction = if depth == 0 {
+                0.0
+            } else {
+                f64::from(best_alt_count) / f64::from(depth)
+            };
+            let is_active = is_active_locus(ref_index, &snp_evidence, depth) || is_active_indel(&indel_evidence);
+            active_region.observed_loci += 1;
+            active_region.max_alt_fraction = active_region.max_alt_fraction.max(alt_fraction);
+            active_region.mean_alt_fraction += alt_fraction;
+
+            if is_active {
+                active_region.active_loci += 1;
+                output.active_loci.push(ReplayActiveLocusRow {
+                    contig: region_interval.contig.clone(),
+                    pos: pos1,
+                    region: region.clone(),
+                    ref_base,
+                    depth,
+                    snp_alt_count,
+                    snp_best_alt: snp_alt
+                        .map(|(base_index, _)| base_from_index(base_index) as char)
+                        .map(|base| base.to_string())
+                        .unwrap_or_default(),
+                    indel_alt_count,
+                    indel_best_alt: indel_alt
+                        .as_ref()
+                        .map(|(allele, _)| indel_allele_label(allele))
+                        .unwrap_or_default(),
+                    alt_fraction,
+                    active_probability_proxy: is_active as u8 as f64,
+                });
+            }
+
+            if let Some(call) = best_snp_call(
+                &region_interval.contig,
+                pos1,
+                ref_base,
+                snp_evidence,
+                config.standard_min_confidence_threshold_for_calling,
+            ) {
+                active_region.candidate_events += 1;
+                output.events.push(replay_event_row(&region, &call)?);
+                output.variants.push(call);
+            }
+            if let Some(call) = best_indel_call(
+                &region_interval.contig,
+                pos1,
+                window.start,
+                &ref_bases,
+                indel_evidence,
+                config.standard_min_confidence_threshold_for_calling,
+            ) {
+                active_region.candidate_events += 1;
+                output.events.push(replay_event_row(&region, &call)?);
+                output.variants.push(call);
+            }
         }
-        if let Some(call) = best_indel_call(
-            &window.contig,
-            pos1,
-            window.start,
-            &ref_bases,
-            indel_evidence,
-            config.standard_min_confidence_threshold_for_calling,
-        ) {
-            active_region.candidate_events += 1;
-            output.events.push(replay_event_row(&region, &call)?);
-            output.variants.push(call);
+        if active_region.observed_loci > 0 {
+            active_region.mean_alt_fraction /= active_region.observed_loci as f64;
         }
+        output.active_regions.push(active_region);
     }
-    if active_region.observed_loci > 0 {
-        active_region.mean_alt_fraction /= active_region.observed_loci as f64;
-    }
-    output.active_regions.push(active_region);
     Ok(())
 }
 
