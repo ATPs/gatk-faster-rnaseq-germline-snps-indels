@@ -16,6 +16,9 @@ use std::ptr;
 const PIPELINE_MIN_MAPQ: u8 = 20;
 const PIPELINE_MIN_BASEQ: u8 = 10;
 const PIPELINE_MAX_DEPTH: u32 = 100_000;
+// GATK: minTailQuality = minBaseQualityScore - 1 for the non-error-correction path.
+// See AssemblyBasedCallerUtils.finalizeRegion and HaplotypeCallerEngine.
+const PIPELINE_MIN_TAIL_QUALITY: u8 = PIPELINE_MIN_BASEQ - 1;
 const FETCH_WINDOW_GAP: u64 = 1_000;
 const FETCH_WINDOW_MAX_BASES: u64 = 2_000_000;
 const MAX_BOOTSTRAP_INDEL_LEN: u32 = 200;
@@ -25,6 +28,14 @@ const HALF_DEFAULT_PCR_SNV_QUAL: u8 = 20;
 const FISHER_STRAND_TARGET_TABLE_SIZE: f64 = 200.0;
 const FISHER_STRAND_MIN_PVALUE: f64 = 1e-320;
 const CALL_PARTITIONS_PER_THREAD: usize = 8;
+
+// GATK's isActive() uses a minimal confidence threshold of 4.0 for
+// active-region discovery, much lower than the standard calling threshold.
+const ACTIVE_REGION_DISCOVERY_CONFIDENCE: f64 = 4.0;
+
+// GATK: reads shorter than this after trimming are removed before genotyping.
+// See AssemblyBasedCallerUtils.MINIMUM_READ_LENGTH_AFTER_TRIMMING.
+const MIN_READ_LENGTH_AFTER_TRIMMING: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct HaplotypeCallerConfig {
@@ -54,6 +65,124 @@ pub struct HaplotypeReplayStats {
     pub read_observations: usize,
     pub candidate_events: usize,
     pub genotype_rows: usize,
+}
+
+/// Simplified ref-vs-any active probability, mirroring GATK's
+/// ReferenceConfidenceModel.calcGenotypeLikelihoodsOfRefVsAny +
+/// MinimalGenotypingEngine.calculateSingleSampleRefVsAnyActiveStateProfileValue.
+///
+/// Returns true if the locus is "active" — i.e., likely to harbor variation.
+fn is_active_locus(ref_index: Option<usize>, evidence: &SnpEvidence, depth: u32) -> bool {
+    let ref_index = match ref_index {
+        Some(idx) => idx,
+        None => return false,
+    };
+    if depth < 2 {
+        return false;
+    }
+
+    // Compute ref-vs-any log10 likelihoods for diploid genotype states.
+    let mut log10_likelihoods = [0.0_f64; 3]; // hom-ref, het, hom-alt
+    for observation in &evidence.observations {
+        let error = phred_error_probability(observation.quality);
+        let ref_prob = snp_observation_probability(observation.base_index == ref_index, error);
+        // For ref-vs-any, any non-reference base is considered alt evidence.
+        let alt_prob = if observation.base_index != ref_index {
+            1.0 - error
+        } else {
+            error / 3.0
+        }
+        .max(f64::MIN_POSITIVE);
+        add_diploid_observation(&mut log10_likelihoods, ref_prob, alt_prob);
+    }
+
+    // Use a flat prior (no population prior for active detection, like GATK
+    // uses a very low effective confidence threshold).
+    let denominator = log10_sum_exp(&log10_likelihoods);
+    let ref_posterior_log10 = log10_likelihoods[0] - denominator;
+    let qual = phred_from_log10_probability(ref_posterior_log10);
+
+    // Active if QUAL exceeds the low discovery threshold (GATK uses 4.0).
+    f64::from(qual) >= ACTIVE_REGION_DISCOVERY_CONFIDENCE
+}
+
+/// Compute the effective clipped span of a read for evidence collection.
+/// Returns (seq_start_qpos, seq_end_qpos_exclusive) where the span excludes:
+///  - soft-clipped bases (hard-clipped when dont_use_soft_clipped_bases)
+///  - low-quality tail bases (quality < min_tail_quality)
+///
+/// Mirrors GATK's AssemblyBasedCallerUtils.finalizeRegion() clipping logic:
+/// ReadClipper.hardClipSoftClippedBases + ReadClipper.hardClipLowQualEnds.
+fn clip_read_for_evidence(
+    record: &bam::Record,
+    min_tail_quality: u8,
+    dont_use_soft_clipped_bases: bool,
+) -> Option<(usize, usize)> {
+    let seq = record.seq();
+    let qual = record.qual();
+    if seq.is_empty() {
+        return None;
+    }
+
+    let seq_len = seq.len();
+    let mut qpos = 0_usize;
+    let mut align_start: Option<usize> = None;
+    let mut align_end: Option<usize> = None;
+
+    for op in record.cigar().iter() {
+        let len = match op {
+            Cigar::Match(l)
+            | Cigar::Equal(l)
+            | Cigar::Diff(l)
+            | Cigar::Ins(l)
+            | Cigar::SoftClip(l) => *l as usize,
+            Cigar::Del(_) | Cigar::RefSkip(_) => {
+                continue;
+            }
+            Cigar::HardClip(_) | Cigar::Pad(_) => continue,
+        };
+
+        match op {
+            Cigar::SoftClip(_) => {
+                if dont_use_soft_clipped_bases {
+                    qpos += len;
+                } else {
+                    if align_start.is_none() {
+                        align_start = Some(qpos);
+                    }
+                    qpos += len;
+                    align_end = Some(qpos);
+                }
+            }
+            Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_) | Cigar::Ins(_) => {
+                if align_start.is_none() {
+                    align_start = Some(qpos);
+                }
+                qpos += len;
+                align_end = Some(qpos);
+            }
+            _ => {}
+        }
+    }
+
+    let mut start = align_start?;
+    let mut end = align_end?;
+    if end <= start || start >= seq_len {
+        return None;
+    }
+    end = end.min(seq_len);
+
+    while start < end && qual.get(start).copied().unwrap_or(0) < min_tail_quality {
+        start += 1;
+    }
+    while end > start && qual.get(end - 1).copied().unwrap_or(0) < min_tail_quality {
+        end -= 1;
+    }
+
+    if end - start < MIN_READ_LENGTH_AFTER_TRIMMING {
+        return None;
+    }
+    Some((start, end))
 }
 
 pub fn call_variants(config: &HaplotypeCallerConfig) -> Result<()> {
@@ -636,7 +765,13 @@ fn scan_call_window(
             &window.contig,
             pos1,
             ref_base,
-            pileup_snp_evidence(&pileup, PIPELINE_MIN_BASEQ, PIPELINE_MIN_MAPQ),
+            pileup_snp_evidence(
+                &pileup,
+                PIPELINE_MIN_BASEQ,
+                PIPELINE_MIN_MAPQ,
+                PIPELINE_MIN_TAIL_QUALITY,
+                config.dont_use_soft_clipped_bases,
+            ),
             config.standard_min_confidence_threshold_for_calling,
         ) {
             output.variants.push(call);
@@ -646,7 +781,13 @@ fn scan_call_window(
             pos1,
             window.start,
             &ref_bases,
-            pileup_indel_evidence(&pileup, PIPELINE_MIN_BASEQ, PIPELINE_MIN_MAPQ),
+            pileup_indel_evidence(
+                &pileup,
+                PIPELINE_MIN_BASEQ,
+                PIPELINE_MIN_MAPQ,
+                PIPELINE_MIN_TAIL_QUALITY,
+                config.dont_use_soft_clipped_bases,
+            ),
             config.standard_min_confidence_threshold_for_calling,
         ) {
             output.variants.push(call);
@@ -753,12 +894,16 @@ fn scan_replay_window(
             &pileup,
             PIPELINE_MIN_BASEQ,
             PIPELINE_MIN_MAPQ,
+            PIPELINE_MIN_TAIL_QUALITY,
+            config.dont_use_soft_clipped_bases,
             Some(&row_context),
         );
         let (indel_evidence, indel_rows) = pileup_indel_evidence_with_rows(
             &pileup,
             PIPELINE_MIN_BASEQ,
             PIPELINE_MIN_MAPQ,
+            PIPELINE_MIN_TAIL_QUALITY,
+            config.dont_use_soft_clipped_bases,
             Some(&row_context),
         );
         output.read_observations.extend(snp_rows);
@@ -776,11 +921,12 @@ fn scan_replay_window(
         } else {
             f64::from(best_alt_count) / f64::from(depth)
         };
+        let is_active = is_active_locus(ref_index, &snp_evidence, depth);
         active_region.observed_loci += 1;
         active_region.max_alt_fraction = active_region.max_alt_fraction.max(alt_fraction);
         active_region.mean_alt_fraction += alt_fraction;
 
-        if best_alt_count > 0 {
+        if is_active {
             active_region.active_loci += 1;
             output.active_loci.push(ReplayActiveLocusRow {
                 contig: window.contig.clone(),
@@ -799,7 +945,7 @@ fn scan_replay_window(
                     .map(|(allele, _)| indel_allele_label(allele))
                     .unwrap_or_default(),
                 alt_fraction,
-                active_probability_proxy: alt_fraction,
+                active_probability_proxy: is_active as u8 as f64,
             });
         }
 
@@ -834,14 +980,30 @@ fn scan_replay_window(
     Ok(())
 }
 
-fn pileup_snp_evidence(pileup: &bam::pileup::Pileup, min_baseq: u8, min_mapq: u8) -> SnpEvidence {
-    pileup_snp_evidence_with_rows(pileup, min_baseq, min_mapq, None).0
+fn pileup_snp_evidence(
+    pileup: &bam::pileup::Pileup,
+    min_baseq: u8,
+    min_mapq: u8,
+    min_tail_quality: u8,
+    dont_use_soft_clipped_bases: bool,
+) -> SnpEvidence {
+    pileup_snp_evidence_with_rows(
+        pileup,
+        min_baseq,
+        min_mapq,
+        min_tail_quality,
+        dont_use_soft_clipped_bases,
+        None,
+    )
+    .0
 }
 
 fn pileup_snp_evidence_with_rows(
     pileup: &bam::pileup::Pileup,
     min_baseq: u8,
     min_mapq: u8,
+    min_tail_quality: u8,
+    dont_use_soft_clipped_bases: bool,
     row_context: Option<&ReplayRowContext<'_>>,
 ) -> (SnpEvidence, Vec<ReplayReadObservationRow>) {
     let mut observations_by_fragment: HashMap<Vec<u8>, Vec<NamedBaseObservation>> = HashMap::new();
@@ -860,6 +1022,18 @@ fn pileup_snp_evidence_with_rows(
         {
             continue;
         }
+
+        // Apply GATK-like read clipping (hard-clip soft-clips, low-quality tails).
+        if let Some((clip_start, clip_end)) =
+            clip_read_for_evidence(&record, min_tail_quality, dont_use_soft_clipped_bases)
+        {
+            if qpos < clip_start || qpos >= clip_end {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
         let base = normalize_base(record.seq()[qpos]);
         let Some(index) = base_index(base) else {
             continue;
@@ -967,14 +1141,26 @@ fn pileup_indel_evidence(
     pileup: &bam::pileup::Pileup,
     min_baseq: u8,
     min_mapq: u8,
+    min_tail_quality: u8,
+    dont_use_soft_clipped_bases: bool,
 ) -> IndelEvidence {
-    pileup_indel_evidence_with_rows(pileup, min_baseq, min_mapq, None).0
+    pileup_indel_evidence_with_rows(
+        pileup,
+        min_baseq,
+        min_mapq,
+        min_tail_quality,
+        dont_use_soft_clipped_bases,
+        None,
+    )
+    .0
 }
 
 fn pileup_indel_evidence_with_rows(
     pileup: &bam::pileup::Pileup,
     min_baseq: u8,
     min_mapq: u8,
+    min_tail_quality: u8,
+    dont_use_soft_clipped_bases: bool,
     row_context: Option<&ReplayRowContext<'_>>,
 ) -> (IndelEvidence, Vec<ReplayReadObservationRow>) {
     let mut observations_by_fragment: HashMap<Vec<u8>, Vec<NamedIndelObservation>> = HashMap::new();
@@ -993,6 +1179,18 @@ fn pileup_indel_evidence_with_rows(
         {
             continue;
         }
+
+        // Apply GATK-like read clipping.
+        if let Some((clip_start, clip_end)) =
+            clip_read_for_evidence(&record, min_tail_quality, dont_use_soft_clipped_bases)
+        {
+            if qpos < clip_start || qpos >= clip_end {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
         let allele = match alignment.indel() {
             Indel::None => Some(IndelObservationAllele::Ref),
             Indel::Ins(len) if len <= MAX_BOOTSTRAP_INDEL_LEN => {
