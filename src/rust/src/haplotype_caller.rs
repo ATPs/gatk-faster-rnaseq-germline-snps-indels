@@ -1,3 +1,4 @@
+use crate::pair_hmm;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -12,7 +13,6 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use crate::pair_hmm;
 
 const PIPELINE_MIN_MAPQ: u8 = 20;
 const PIPELINE_MIN_BASEQ: u8 = 10;
@@ -85,12 +85,7 @@ fn is_active_indel(evidence: &IndelEvidence) -> (bool, u32) {
         let error = phred_error_probability(observation.quality);
         let is_ref = matches!(observation.allele, IndelObservationAllele::Ref);
         let ref_prob = snp_observation_probability(is_ref, error);
-        let alt_prob = if !is_ref {
-            1.0 - error
-        } else {
-            error / 3.0
-        }
-        .max(f64::MIN_POSITIVE);
+        let alt_prob = if !is_ref { 1.0 - error } else { error / 3.0 }.max(f64::MIN_POSITIVE);
         add_diploid_observation(&mut log10_likelihoods, ref_prob, alt_prob);
     }
     let denominator = log10_sum_exp(&log10_likelihoods);
@@ -739,7 +734,6 @@ fn scan_replay_partition(
     Ok(output)
 }
 
-
 fn discover_active_regions(
     config: &HaplotypeCallerConfig,
     tid: u32,
@@ -869,8 +863,14 @@ fn discover_active_regions(
 
     let mut coalesced: Vec<Interval> = Vec::new();
     for mut reg in split_active_regions {
-        reg.start = reg.start.saturating_sub(ACTIVE_REGION_PADDING).max(window.start);
-        reg.end = reg.end.saturating_add(ACTIVE_REGION_PADDING).min(window.end);
+        reg.start = reg
+            .start
+            .saturating_sub(ACTIVE_REGION_PADDING)
+            .max(window.start);
+        reg.end = reg
+            .end
+            .saturating_add(ACTIVE_REGION_PADDING)
+            .min(window.end);
         coalesced.push(reg);
     }
 
@@ -894,29 +894,66 @@ fn scan_call_window(
     })?;
     let ref_len = reference.fetch_seq_len(&window.contig);
     if ref_len == 0 {
-        bail!("contig '{}' is not present in reference FASTA {}", window.contig, config.reference.display());
+        bail!(
+            "contig '{}' is not present in reference FASTA {}",
+            window.contig,
+            config.reference.display()
+        );
     }
     if window.end > ref_len {
-        bail!("interval {}:{}-{} extends past FASTA contig length {}", window.contig, window.start, window.end, ref_len);
+        bail!(
+            "interval {}:{}-{} extends past FASTA contig length {}",
+            window.contig,
+            window.start,
+            window.end,
+            ref_len
+        );
     }
 
-    let ref_end = window.end.saturating_add(u64::from(MAX_BOOTSTRAP_INDEL_LEN)).min(ref_len);
-    let ref_bases = reference.fetch_seq(&window.contig, (window.start - 1) as usize, (ref_end - 1) as usize)
-        .with_context(|| format!("fetching reference sequence {}:{}-{}", window.contig, window.start, ref_end))?;
+    let ref_end = window
+        .end
+        .saturating_add(u64::from(MAX_BOOTSTRAP_INDEL_LEN))
+        .min(ref_len);
+    let ref_bases = reference
+        .fetch_seq(
+            &window.contig,
+            (window.start - 1) as usize,
+            (ref_end - 1) as usize,
+        )
+        .with_context(|| {
+            format!(
+                "fetching reference sequence {}:{}-{}",
+                window.contig, window.start, ref_end
+            )
+        })?;
 
     let active_regions = discover_active_regions(config, tid, window, &ref_bases, bam)?;
 
     for region in active_regions {
         bam.fetch((tid as i32, (region.start - 1) as i64, region.end as i64))
-            .with_context(|| format!("fetching BAM region {}:{}-{}", region.contig, region.start, region.end))?;
+            .with_context(|| {
+                format!(
+                    "fetching BAM region {}:{}-{}",
+                    region.contig, region.start, region.end
+                )
+            })?;
 
         let mut read_bases_list = Vec::new();
         let mut read_quals_list = Vec::new();
+        let mut read_ins_quals_list = Vec::new();
+        let mut read_del_quals_list = Vec::new();
         let mut read_is_reverse_list = Vec::new();
-        
+        let mut read_use_for_assembly_list = Vec::new();
+        let mut reads_by_start = std::collections::HashMap::new();
+
         for r in bam.records() {
             let record = r?;
-            if record.is_unmapped() || record.is_secondary() || record.is_supplementary() || record.is_duplicate() || record.is_quality_check_failed() {
+            if record.is_unmapped()
+                || record.is_secondary()
+                || record.is_supplementary()
+                || record.is_duplicate()
+                || record.is_quality_check_failed()
+            {
                 continue;
             }
             if record.mapq() < PIPELINE_MIN_MAPQ {
@@ -926,8 +963,22 @@ fn scan_call_window(
             let mapq = record.mapq();
             let mut r_bases = Vec::new();
             let mut r_quals = Vec::new();
+            let mut r_ins_quals = Vec::new();
+            let mut r_del_quals = Vec::new();
             let seq = record.seq();
             let quals = record.qual();
+
+            let bi_bytes: Option<&[u8]> = match record.aux(b"BI") {
+                Ok(rust_htslib::bam::record::Aux::String(s)) => Some(s.as_bytes()),
+                _ => None,
+            };
+            let bd_bytes: Option<&[u8]> = match record.aux(b"BD") {
+                Ok(rust_htslib::bam::record::Aux::String(s)) => Some(s.as_bytes()),
+                _ => None,
+            };
+            let has_bi = bi_bytes.is_some() && bi_bytes.unwrap().len() == seq.len();
+            let has_bd = bd_bytes.is_some() && bd_bytes.unwrap().len() == seq.len();
+
             let mut seq_idx = 0;
 
             for view in record.cigar().iter() {
@@ -939,11 +990,39 @@ fn scan_call_window(
                             if i < seq.len() {
                                 r_bases.push(seq[i]);
                                 r_quals.push(quals[i].min(mapq).max(18));
+                                r_ins_quals.push(if has_bi {
+                                    bi_bytes.unwrap()[i].saturating_sub(33)
+                                } else {
+                                    45
+                                });
+                                r_del_quals.push(if has_bd {
+                                    bd_bytes.unwrap()[i].saturating_sub(33)
+                                } else {
+                                    45
+                                });
                             }
                         }
                         seq_idx += len;
                     }
                     SoftClip(_) => {
+                        if !config.dont_use_soft_clipped_bases {
+                            for i in seq_idx..seq_idx + len {
+                                if i < seq.len() {
+                                    r_bases.push(seq[i]);
+                                    r_quals.push(quals[i].min(mapq).max(18));
+                                    r_ins_quals.push(if has_bi {
+                                        bi_bytes.unwrap()[i].saturating_sub(33)
+                                    } else {
+                                        45
+                                    });
+                                    r_del_quals.push(if has_bd {
+                                        bd_bytes.unwrap()[i].saturating_sub(33)
+                                    } else {
+                                        45
+                                    });
+                                }
+                            }
+                        }
                         seq_idx += len;
                     }
                     Del(_) | RefSkip(_) => {}
@@ -952,9 +1031,19 @@ fn scan_call_window(
             }
 
             if !r_bases.is_empty() {
+                let start_pos = record.pos();
+                let count = reads_by_start.entry(start_pos).or_insert(0);
+                let use_for_assembly = *count < 50;
+                if use_for_assembly {
+                    *count += 1;
+                }
+
                 read_bases_list.push(r_bases);
                 read_quals_list.push(r_quals);
+                read_ins_quals_list.push(r_ins_quals);
+                read_del_quals_list.push(r_del_quals);
                 read_is_reverse_list.push(record.is_reverse());
+                read_use_for_assembly_list.push(use_for_assembly);
             }
         }
 
@@ -968,9 +1057,10 @@ fn scan_call_window(
 
         // 1. Assemble haplotypes instead of pileup!
         let max_mnp_distance = 0; // Default GATK
-        // Cap reads for assembly to avoid blowup on deep regions
+                                  // Cap reads for assembly to avoid blowup on deep regions
         let assembly_reads: Vec<&Vec<u8>> = read_bases_list.iter().take(500).collect();
-        let assembly_reads_owned: Vec<Vec<u8>> = assembly_reads.iter().map(|r| (*r).clone()).collect();
+        let assembly_reads_owned: Vec<Vec<u8>> =
+            assembly_reads.iter().map(|r| (*r).clone()).collect();
         let (local_haplotypes, valid_events) = assemble_haplotypes(
             &region.contig,
             region.start,
@@ -990,8 +1080,8 @@ fn scan_call_window(
         for i in 0..n_reads {
             let r_bases = &read_bases_list[i];
             let r_quals = &read_quals_list[i];
-            let read_ins_quals = vec![45; r_bases.len()];
-            let read_del_quals = vec![45; r_bases.len()];
+            let read_ins_quals = &read_ins_quals_list[i];
+            let read_del_quals = &read_del_quals_list[i];
             let gcp = 10;
 
             let mut hap_likelihoods = Vec::with_capacity(local_haplotypes.len());
@@ -1025,18 +1115,21 @@ fn scan_call_window(
             let mut read_allele_likelihoods_alt = vec![0.0; n_reads];
 
             for read_idx in 0..n_reads {
-                let mut best_ref_lhood = f64::NEG_INFINITY;
-                let mut best_alt_lhood = f64::NEG_INFINITY;
+                let mut ref_lhoods = Vec::new();
+                let mut alt_lhoods = Vec::new();
                 for hap_idx in 0..local_haplotypes.len() {
                     let lhood = read_haplotype_likelihoods[read_idx][hap_idx];
                     if hap_contains_allele[hap_idx] {
-                        if lhood > best_alt_lhood { best_alt_lhood = lhood; }
+                        alt_lhoods.push(lhood);
                     } else {
-                        if lhood > best_ref_lhood { best_ref_lhood = lhood; }
+                        ref_lhoods.push(lhood);
                     }
                 }
-                read_allele_likelihoods_ref[read_idx] = best_ref_lhood;
-                read_allele_likelihoods_alt[read_idx] = best_alt_lhood;
+                // take maximum, matching GATK marginalization
+                let ref_val = ref_lhoods.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let alt_val = alt_lhoods.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                read_allele_likelihoods_ref[read_idx] = ref_val;
+                read_allele_likelihoods_alt[read_idx] = alt_val;
             }
 
             let mut ref_count = 0;
@@ -1080,28 +1173,38 @@ fn scan_call_window(
                 log10_likelihoods[1] + log10_priors[1],
                 log10_likelihoods[2] + log10_priors[2],
             ];
-            
-            let genotype_index = if log10_posteriors[0] >= log10_posteriors[1] && log10_posteriors[0] >= log10_posteriors[2] { 0 }
-            else if log10_posteriors[1] >= log10_posteriors[0] && log10_posteriors[1] >= log10_posteriors[2] { 1 }
-            else { 2 };
-            
+
+            let genotype_index = if log10_posteriors[0] >= log10_posteriors[1]
+                && log10_posteriors[0] >= log10_posteriors[2]
+            {
+                0
+            } else if log10_posteriors[1] >= log10_posteriors[0]
+                && log10_posteriors[1] >= log10_posteriors[2]
+            {
+                1
+            } else {
+                2
+            };
+
             let denominator = log10_sum_exp(&log10_posteriors);
             let ref_posterior_log10 = log10_posteriors[0] - denominator;
             let qual = phred_from_log10_probability(ref_posterior_log10);
             let best_posterior = log10_posteriors[genotype_index];
-            
+
             let mut pl = [
                 phred_likelihood_delta(log10_posteriors[0], best_posterior),
                 phred_likelihood_delta(log10_posteriors[1], best_posterior),
                 phred_likelihood_delta(log10_posteriors[2], best_posterior),
             ];
-            
+
             if pl[0] == 0 && pl[1] == 0 && pl[2] == 0 {
                 for i in 0..3 {
-                    if i != genotype_index { pl[i] = 9999; }
+                    if i != genotype_index {
+                        pl[i] = 9999;
+                    }
                 }
             }
-            
+
             let min_confidence = config.standard_min_confidence_threshold_for_calling;
             if (qual as f64) >= min_confidence {
                 let mut final_call = event.clone();
@@ -1112,7 +1215,7 @@ fn scan_call_window(
                 final_call.ref_count = ref_count;
                 final_call.alt_count = alt_count;
                 final_call.fs = fs;
-                
+
                 output.variants.push(final_call);
             }
         }
@@ -1174,22 +1277,31 @@ fn scan_replay_window(
 
     let mut interval_cursor = 0_usize;
     for region_interval in active_regions {
-        bam.fetch((tid as i32, (region_interval.start - 1) as i64, region_interval.end as i64))
-            .with_context(|| {
-                format!(
-                    "fetching BAM region {}:{}-{}",
-                    region_interval.contig, region_interval.start, region_interval.end
-                )
-            })?;
+        bam.fetch((
+            tid as i32,
+            (region_interval.start - 1) as i64,
+            region_interval.end as i64,
+        ))
+        .with_context(|| {
+            format!(
+                "fetching BAM region {}:{}-{}",
+                region_interval.contig, region_interval.start, region_interval.end
+            )
+        })?;
 
-        let region = region_name(&region_interval.contig, region_interval.start, region_interval.end);
+        let region = region_name(
+            &region_interval.contig,
+            region_interval.start,
+            region_interval.end,
+        );
         let mut active_region = ReplayActiveRegionRow {
             contig: region_interval.contig.clone(),
             start: region_interval.start,
             end: region_interval.end,
             region: region.clone(),
             ..ReplayActiveRegionRow::default()
-        };        let mut region_events = Vec::new();
+        };
+        let mut region_events = Vec::new();
 
         let mut pileups = bam.pileup();
         pileups.set_max_depth(PIPELINE_MAX_DEPTH);
@@ -1248,7 +1360,8 @@ fn scan_replay_window(
             } else {
                 f64::from(best_alt_count) / f64::from(depth)
             };
-            let is_active = is_active_locus(ref_index, &snp_evidence, depth).0 || is_active_indel(&indel_evidence).0;
+            let is_active = is_active_locus(ref_index, &snp_evidence, depth).0
+                || is_active_indel(&indel_evidence).0;
             active_region.observed_loci += 1;
             active_region.max_alt_fraction = active_region.max_alt_fraction.max(alt_fraction);
             active_region.mean_alt_fraction += alt_fraction;
@@ -1276,52 +1389,45 @@ fn scan_replay_window(
                 });
             }
 
-            if let Some(call) = best_snp_call(
-                &region_interval.contig,
-                pos1,
-                ref_base,
-                snp_evidence,
-                config.standard_min_confidence_threshold_for_calling,
-            ) {
-                active_region.candidate_events += 1;
-                output.events.push(replay_event_row(&region, &call)?);
-                region_events.push(call);
-            }
-            if let Some(call) = best_indel_call(
-                &region_interval.contig,
-                pos1,
-                window.start,
-                &ref_bases,
-                indel_evidence,
-                config.standard_min_confidence_threshold_for_calling,
-            ) {
-                active_region.candidate_events += 1;
-                output.events.push(replay_event_row(&region, &call)?);
-                region_events.push(call);
-            }
+            // We removed best_snp_call and best_indel_call here
+            // since we will use assemble_haplotypes below.
         }
 
         let ref_region_start_offset = (region_interval.start - window.start) as usize;
         let ref_region_end_offset = (region_interval.end - window.start) as usize;
         let local_ref_bases = &ref_bases[ref_region_start_offset..=ref_region_end_offset];
-        
-        let local_haplotypes = build_local_haplotypes(
-            &region_interval.contig,
-            region_interval.start,
-            region_interval.end,
-            local_ref_bases,
-            &region_events,
-            128,
-        );
 
-        // Fetch reads for this active region for PairHMM
-        bam.fetch((tid as i32, (region_interval.start - 1) as i64, region_interval.end as i64))
-            .with_context(|| format!("fetching BAM region for PairHMM: {}:{}-{}", region_interval.contig, region_interval.start, region_interval.end))?;
-            
-        let mut read_index = 0;
+        bam.fetch((
+            tid as i32,
+            (region_interval.start - 1) as i64,
+            region_interval.end as i64,
+        ))
+        .with_context(|| {
+            format!(
+                "fetching BAM region for PairHMM: {}:{}-{}",
+                region_interval.contig, region_interval.start, region_interval.end
+            )
+        })?;
+
+        let mut read_bases_list = Vec::new();
+        let mut read_quals_list = Vec::new();
+        let mut read_ins_quals_list = Vec::new();
+        let mut read_del_quals_list = Vec::new();
+        let mut read_use_for_assembly_list = Vec::new();
+        let mut reads_by_start = std::collections::HashMap::new();
+        let mut read_names_list = Vec::new();
+        let mut mapq_list = Vec::new();
+        let mut unclipped_loc_list = Vec::new();
+        let mut cigar_string_list = Vec::new();
+
         for r in bam.records() {
             let record = r?;
-            if record.is_unmapped() || record.is_secondary() || record.is_supplementary() || record.is_duplicate() || record.is_quality_check_failed() {
+            if record.is_unmapped()
+                || record.is_secondary()
+                || record.is_supplementary()
+                || record.is_duplicate()
+                || record.is_quality_check_failed()
+            {
                 continue;
             }
             if record.mapq() < PIPELINE_MIN_MAPQ {
@@ -1331,8 +1437,22 @@ fn scan_replay_window(
             let mapq = record.mapq();
             let mut read_bases = Vec::new();
             let mut read_quals = Vec::new();
+            let mut r_ins_quals = Vec::new();
+            let mut r_del_quals = Vec::new();
             let seq = record.seq();
             let quals = record.qual();
+
+            let bi_bytes: Option<&[u8]> = match record.aux(b"BI") {
+                Ok(rust_htslib::bam::record::Aux::String(s)) => Some(s.as_bytes()),
+                _ => None,
+            };
+            let bd_bytes: Option<&[u8]> = match record.aux(b"BD") {
+                Ok(rust_htslib::bam::record::Aux::String(s)) => Some(s.as_bytes()),
+                _ => None,
+            };
+            let has_bi = bi_bytes.is_some() && bi_bytes.unwrap().len() == seq.len();
+            let has_bd = bd_bytes.is_some() && bd_bytes.unwrap().len() == seq.len();
+
             let mut seq_idx = 0;
 
             for view in record.cigar().iter() {
@@ -1341,12 +1461,42 @@ fn scan_replay_window(
                 match view {
                     Match(_) | Equal(_) | Diff(_) | Ins(_) => {
                         for i in seq_idx..seq_idx + len {
-                            read_bases.push(seq[i]);
-                            read_quals.push(quals[i].min(mapq).max(18));
+                            if i < seq.len() {
+                                read_bases.push(seq[i]);
+                                read_quals.push(quals[i].min(mapq).max(18));
+                                r_ins_quals.push(if has_bi {
+                                    bi_bytes.unwrap()[i].saturating_sub(33)
+                                } else {
+                                    45
+                                });
+                                r_del_quals.push(if has_bd {
+                                    bd_bytes.unwrap()[i].saturating_sub(33)
+                                } else {
+                                    45
+                                });
+                            }
                         }
                         seq_idx += len;
                     }
                     SoftClip(_) => {
+                        if !config.dont_use_soft_clipped_bases {
+                            for i in seq_idx..seq_idx + len {
+                                if i < seq.len() {
+                                    read_bases.push(seq[i]);
+                                    read_quals.push(quals[i].min(mapq).max(18));
+                                    r_ins_quals.push(if has_bi {
+                                        bi_bytes.unwrap()[i].saturating_sub(33)
+                                    } else {
+                                        45
+                                    });
+                                    r_del_quals.push(if has_bd {
+                                        bd_bytes.unwrap()[i].saturating_sub(33)
+                                    } else {
+                                        45
+                                    });
+                                }
+                            }
+                        }
                         seq_idx += len;
                     }
                     Del(_) | RefSkip(_) => {}
@@ -1354,41 +1504,95 @@ fn scan_replay_window(
                 }
             }
 
-            if read_bases.is_empty() {
-                continue;
-            }
+            if !read_bases.is_empty() {
+                let start_pos = record.pos();
+                let count = reads_by_start.entry(start_pos).or_insert(0);
+                let use_for_assembly = *count < 50;
+                if use_for_assembly {
+                    *count += 1;
+                }
 
-            let read_ins_quals = vec![45; read_bases.len()];
-            let read_del_quals = vec![45; read_bases.len()];
+                read_bases_list.push(read_bases);
+                read_quals_list.push(read_quals);
+                read_ins_quals_list.push(r_ins_quals);
+                read_del_quals_list.push(r_del_quals);
+                read_use_for_assembly_list.push(use_for_assembly);
+                read_names_list.push(String::from_utf8_lossy(record.qname()).into_owned());
+                mapq_list.push(mapq);
+                unclipped_loc_list.push((record.pos() + 1) as u64);
+                cigar_string_list.push(record.cigar().to_string());
+            }
+        }
+
+        let mut assembly_reads: Vec<&Vec<u8>> = Vec::new();
+        for (i, use_for_assembly) in read_use_for_assembly_list.iter().enumerate() {
+            if *use_for_assembly {
+                assembly_reads.push(&read_bases_list[i]);
+            }
+        }
+        let assembly_reads_owned: Vec<Vec<u8>> =
+            assembly_reads.iter().map(|r| (*r).clone()).collect();
+        let max_mnp_distance = 0; // Default GATK
+        let (local_haplotypes, valid_events) = assemble_haplotypes(
+            &region_interval.contig,
+            region_interval.start,
+            local_ref_bases,
+            &assembly_reads_owned,
+            &[10, 25],
+            max_mnp_distance,
+        );
+
+        for call in &valid_events {
+            active_region.candidate_events += 1;
+            output.events.push(replay_event_row(&region, call)?);
+        }
+
+        for (hap_idx, hap) in local_haplotypes.iter().enumerate() {
+            output.haplotypes.push(ReplayHaplotypeRow {
+                region: region.clone(),
+                stage: "assembled",
+                haplotype: hap_idx,
+                span_start: region_interval.start,
+                span_end: region_interval.end,
+                kmer: 0,
+                length: hap.bases.len() as u32,
+                cigar: hap.cigar.clone(),
+                is_ref: hap.is_ref,
+                bases: String::from_utf8_lossy(&hap.bases).into_owned(),
+            });
+        }
+
+        let n_reads = read_bases_list.len();
+        for i in 0..n_reads {
+            let read_bases = &read_bases_list[i];
+            let read_quals = &read_quals_list[i];
+            let read_ins_quals = &read_ins_quals_list[i];
+            let read_del_quals = &read_del_quals_list[i];
             let gcp = 10;
 
-            let read_name = String::from_utf8_lossy(record.qname()).into_owned();
-            let unclipped_loc = (record.pos() + 1) as u64; // Approximation for debug output
-
-            for (i, hap) in local_haplotypes.iter().enumerate() {
+            for (hap_idx, hap) in local_haplotypes.iter().enumerate() {
                 let score = pair_hmm::compute_read_likelihood_given_haplotype(
                     &hap.bases,
-                    &read_bases,
-                    &read_quals,
-                    &read_ins_quals,
-                    &read_del_quals,
+                    read_bases,
+                    read_quals,
+                    read_ins_quals,
+                    read_del_quals,
                     gcp,
                 );
 
                 output.pairhmms.push(ReplayPairHmmRow {
                     region: region.clone(),
-                    read: read_name.clone(),
-                    haplotype: i,
-                    read_index,
-                    cigar: record.cigar().to_string(),
-                    mapq,
-                    loc: unclipped_loc, // Approximation
-                    unclipped_loc,
+                    read: read_names_list[i].clone(),
+                    haplotype: hap_idx,
+                    read_index: i,
+                    cigar: cigar_string_list[i].clone(),
+                    mapq: mapq_list[i],
+                    loc: unclipped_loc_list[i],
+                    unclipped_loc: unclipped_loc_list[i],
                     length: read_bases.len() as u32,
                     score,
                 });
             }
-            read_index += 1;
         }
 
         for (i, hap) in local_haplotypes.into_iter().enumerate() {
@@ -2956,11 +3160,19 @@ fn build_local_haplotypes(
             bases.extend_from_slice(&ev.alt_allele);
             let match_len = (ev.alt_allele.len() as u32).min(ev.ref_allele.len() as u32);
             push_cigar(&mut cigar_ops, match_len, 'M');
-            
+
             if ev.alt_allele.len() > ev.ref_allele.len() {
-                push_cigar(&mut cigar_ops, (ev.alt_allele.len() - ev.ref_allele.len()) as u32, 'I');
+                push_cigar(
+                    &mut cigar_ops,
+                    (ev.alt_allele.len() - ev.ref_allele.len()) as u32,
+                    'I',
+                );
             } else if ev.ref_allele.len() > ev.alt_allele.len() {
-                push_cigar(&mut cigar_ops, (ev.ref_allele.len() - ev.alt_allele.len()) as u32, 'D');
+                push_cigar(
+                    &mut cigar_ops,
+                    (ev.ref_allele.len() - ev.alt_allele.len()) as u32,
+                    'D',
+                );
             }
 
             ref_offset += ev.ref_allele.len();
@@ -3553,7 +3765,9 @@ mod tests {
 }
 
 fn is_regular_allele(allele: &[u8]) -> bool {
-    allele.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
+    allele
+        .iter()
+        .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
 }
 
 pub fn extract_variants_from_cigar(
@@ -3566,12 +3780,12 @@ pub fn extract_variants_from_cigar(
     max_mnp_distance: usize,
 ) -> Vec<VariantCall> {
     use rust_htslib::bam::record::Cigar::*;
-    
+
     let mut ref_pos = alignment_offset;
     if ref_pos < 0 {
         return Vec::new();
     }
-    
+
     let mut alignment_pos = 0;
     let mut proposed_events = Vec::new();
     let num_cigar_elements = cigar.len();
@@ -3580,12 +3794,18 @@ pub fn extract_variants_from_cigar(
         match ce {
             Ins(len) => {
                 let element_length = *len as usize;
-                if element_length <= 10 && ref_pos > 0 && cigar_index > 0 && cigar_index < num_cigar_elements - 1 {
+                if element_length <= 10
+                    && ref_pos > 0
+                    && cigar_index > 0
+                    && cigar_index < num_cigar_elements - 1
+                {
                     let insertion_start = region_start + ref_pos as u64 - 1;
                     let ref_byte = ref_bases[ref_pos as usize - 1];
                     let mut insertion_bases = vec![ref_byte];
-                    insertion_bases.extend_from_slice(&alt_bases[alignment_pos..alignment_pos + element_length]);
-                    
+                    insertion_bases.extend_from_slice(
+                        &alt_bases[alignment_pos..alignment_pos + element_length],
+                    );
+
                     if is_regular_allele(&[ref_byte]) && is_regular_allele(&insertion_bases) {
                         proposed_events.push(VariantCall {
                             contig: contig.to_string(),
@@ -3615,8 +3835,10 @@ pub fn extract_variants_from_cigar(
                     let deletion_start = region_start + ref_pos as u64 - 1;
                     let ref_byte = ref_bases[ref_pos as usize - 1];
                     let mut deletion_bases = vec![ref_byte];
-                    deletion_bases.extend_from_slice(&ref_bases[ref_pos as usize..ref_pos as usize + element_length]);
-                    
+                    deletion_bases.extend_from_slice(
+                        &ref_bases[ref_pos as usize..ref_pos as usize + element_length],
+                    );
+
                     if is_regular_allele(&deletion_bases) && is_regular_allele(&[ref_byte]) {
                         proposed_events.push(VariantCall {
                             contig: contig.to_string(),
@@ -3640,7 +3862,7 @@ pub fn extract_variants_from_cigar(
             Match(len) | Equal(len) | Diff(len) => {
                 let element_length = *len as usize;
                 let mut mismatch_offsets = std::collections::VecDeque::new();
-                
+
                 for offset in 0..element_length {
                     let r_idx = ref_pos as usize + offset;
                     let a_idx = alignment_pos + offset;
@@ -3663,10 +3885,12 @@ pub fn extract_variants_from_cigar(
                             break;
                         }
                     }
-                    
-                    let ref_allele = ref_bases[ref_pos as usize + start..=ref_pos as usize + end].to_vec();
-                    let alt_allele = alt_bases[alignment_pos + start..=alignment_pos + end].to_vec();
-                    
+
+                    let ref_allele =
+                        ref_bases[ref_pos as usize + start..=ref_pos as usize + end].to_vec();
+                    let alt_allele =
+                        alt_bases[alignment_pos + start..=alignment_pos + end].to_vec();
+
                     if is_regular_allele(&ref_allele) && is_regular_allele(&alt_allele) {
                         proposed_events.push(VariantCall {
                             contig: contig.to_string(),
@@ -3694,7 +3918,7 @@ pub fn extract_variants_from_cigar(
             }
         }
     }
-    
+
     proposed_events
 }
 
@@ -3709,7 +3933,7 @@ pub fn assemble_haplotypes(
     use std::collections::HashSet;
     let mut assembled_haplotypes_set = HashSet::new();
     let mut local_haps = Vec::new();
-    
+
     let ref_hap = LocalHaplotype {
         bases: ref_bases.to_vec(),
         is_ref: true,
@@ -3718,37 +3942,39 @@ pub fn assemble_haplotypes(
     };
     local_haps.push(ref_hap);
     assembled_haplotypes_set.insert(ref_bases.to_vec());
-    
+
     // We'll store events per haplotype as Vec<Vec<VariantCall>>
     let mut hap_events = vec![Vec::new()]; // first is ref, no events
-    
+
     for &kmer_size in kmer_sizes {
         if ref_bases.len() < kmer_size {
             continue;
         }
         let mut graph = crate::assembly::ReadThreadingGraph::new(kmer_size);
         graph.add_sequence(ref_bases, true);
-        
+
         for read_bases in reads_bases {
             if read_bases.len() >= kmer_size {
                 graph.add_sequence(read_bases, false);
             }
         }
-        
+
         let source_kmer = &ref_bases[0..kmer_size];
         let sink_kmer = &ref_bases[ref_bases.len() - kmer_size..];
-        
+
         let source_idx = graph.get_or_create_vertex(source_kmer);
         let sink_idx = graph.get_or_create_vertex(sink_kmer);
-        
-        let best_paths = graph.find_best_haplotypes(source_idx, sink_idx, 10);
-        
+
+        graph.prune(2); // min_prune_factor = 2
+
+        let best_paths = graph.find_best_haplotypes(source_idx, sink_idx, 128);
+
         let mut found_nonref = false;
         for path in best_paths {
             let seq = graph.reconstruct_sequence(&path);
             if !assembled_haplotypes_set.contains(&seq) {
                 assembled_haplotypes_set.insert(seq.clone());
-                
+
                 let sw_params = crate::smith_waterman::SWParameters::default();
                 let align_result = crate::smith_waterman::align(
                     ref_bases,
@@ -3756,7 +3982,7 @@ pub fn assemble_haplotypes(
                     &sw_params,
                     crate::smith_waterman::SWOverhangStrategy::SoftClip,
                 );
-                
+
                 let events = extract_variants_from_cigar(
                     contig,
                     ref_bases,
@@ -3766,9 +3992,9 @@ pub fn assemble_haplotypes(
                     region_start,
                     max_mnp_distance,
                 );
-                
+
                 hap_events.push(events);
-                
+
                 local_haps.push(LocalHaplotype {
                     bases: seq,
                     is_ref: false,
@@ -3783,27 +4009,35 @@ pub fn assemble_haplotypes(
             break;
         }
     }
-    
+
     // Deduplicate events across all haplotypes
     let mut unique_events: Vec<VariantCall> = Vec::new();
     for events in &hap_events {
         for event in events {
-            if !unique_events.iter().any(|e| e.pos == event.pos && e.ref_allele == event.ref_allele && e.alt_allele == event.alt_allele) {
+            if !unique_events.iter().any(|e| {
+                e.pos == event.pos
+                    && e.ref_allele == event.ref_allele
+                    && e.alt_allele == event.alt_allele
+            }) {
                 unique_events.push(event.clone());
             }
         }
     }
-    
+
     // Now map event indices back to each haplotype
     for (hap_idx, events) in hap_events.iter().enumerate() {
         for event in events {
-            if let Some(idx) = unique_events.iter().position(|e| e.pos == event.pos && e.ref_allele == event.ref_allele && e.alt_allele == event.alt_allele) {
+            if let Some(idx) = unique_events.iter().position(|e| {
+                e.pos == event.pos
+                    && e.ref_allele == event.ref_allele
+                    && e.alt_allele == event.alt_allele
+            }) {
                 if !local_haps[hap_idx].event_indices.contains(&idx) {
                     local_haps[hap_idx].event_indices.push(idx);
                 }
             }
         }
     }
-    
+
     (local_haps, unique_events)
 }

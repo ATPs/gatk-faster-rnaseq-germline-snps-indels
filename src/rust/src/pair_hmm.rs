@@ -53,7 +53,11 @@ pub fn compute_read_likelihood_given_haplotype(
 
     let mut transitions = Vec::with_capacity(read_len);
     for i in 0..read_len {
-        transitions.push(qual_to_trans_probs(read_ins_quals[i], read_del_quals[i], gcp));
+        transitions.push(qual_to_trans_probs(
+            read_ins_quals[i],
+            read_del_quals[i],
+            gcp,
+        ));
     }
 
     let initial_value = 1.0 / (hap_len as f64);
@@ -82,14 +86,15 @@ pub fn compute_read_likelihood_given_haplotype(
                 p_mismatch
             };
 
-            match_matrix[i][j] = prior * (
-                match_matrix[i - 1][j - 1] * t.m2m +
-                insertion_matrix[i - 1][j - 1] * t.i2m +
-                deletion_matrix[i - 1][j - 1] * t.d2m
-            );
-            
-            insertion_matrix[i][j] = match_matrix[i - 1][j] * t.m2i + insertion_matrix[i - 1][j] * t.i2i;
-            deletion_matrix[i][j] = match_matrix[i][j - 1] * t.m2d + deletion_matrix[i][j - 1] * t.d2d;
+            match_matrix[i][j] = prior
+                * (match_matrix[i - 1][j - 1] * t.m2m
+                    + insertion_matrix[i - 1][j - 1] * t.i2m
+                    + deletion_matrix[i - 1][j - 1] * t.d2m);
+
+            insertion_matrix[i][j] =
+                match_matrix[i - 1][j] * t.m2i + insertion_matrix[i - 1][j] * t.i2i;
+            deletion_matrix[i][j] =
+                match_matrix[i][j - 1] * t.m2d + deletion_matrix[i][j - 1] * t.d2d;
         }
     }
 

@@ -51,7 +51,9 @@ pub fn align(
     }
 
     // Try substring matching for softclip/ignore
-    if overhang_strategy == SWOverhangStrategy::SoftClip || overhang_strategy == SWOverhangStrategy::Ignore {
+    if overhang_strategy == SWOverhangStrategy::SoftClip
+        || overhang_strategy == SWOverhangStrategy::Ignore
+    {
         if let Some(pos) = find_subsequence(reference, alternate) {
             return SWAlignmentResult {
                 cigar: CigarString(vec![Cigar::Match(alternate.len() as u32)]),
@@ -66,17 +68,28 @@ pub fn align(
     let mut sw = vec![vec![0; m]; n];
     let mut btrack = vec![vec![0; m]; n];
 
-    calculate_matrix(reference, alternate, &mut sw, &mut btrack, &overhang_strategy, parameters);
+    calculate_matrix(
+        reference,
+        alternate,
+        &mut sw,
+        &mut btrack,
+        &overhang_strategy,
+        parameters,
+    );
     calculate_cigar(&sw, &btrack, &overhang_strategy)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() { return Some(0); }
-    if haystack.len() < needle.len() { return None; }
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
     // find last index to match java's lastIndexOf, though usually first is fine.
     // Let's match lastIndexOf just in case.
     for i in (0..=haystack.len() - needle.len()).rev() {
-        if &haystack[i..i+needle.len()] == needle {
+        if &haystack[i..i + needle.len()] == needle {
             return Some(i);
         }
     }
@@ -102,7 +115,9 @@ fn calculate_matrix(
     let mut best_gap_h = vec![low_init_value; nrow + 1];
     let mut gap_size_h = vec![0; nrow + 1];
 
-    if *overhang_strategy == SWOverhangStrategy::Indel || *overhang_strategy == SWOverhangStrategy::LeadingIndel {
+    if *overhang_strategy == SWOverhangStrategy::Indel
+        || *overhang_strategy == SWOverhangStrategy::LeadingIndel
+    {
         sw[0][1] = parameters.gap_open_penalty;
         let mut cur_val = parameters.gap_open_penalty;
         for i in 2..ncol {
@@ -127,8 +142,13 @@ fn calculate_matrix(
         let a_base = reference[i - 1];
         for j in 1..ncol {
             let b_base = alternate[j - 1];
-            
-            let step_diag = sw[i - 1][j - 1] + if a_base == b_base { w_match } else { w_mismatch };
+
+            let step_diag = sw[i - 1][j - 1]
+                + if a_base == b_base {
+                    w_match
+                } else {
+                    w_mismatch
+                };
 
             let mut prev_gap = sw[i - 1][j] + w_open;
             best_gap_v[j] = best_gap_v[j].saturating_add(w_extend);
@@ -193,11 +213,14 @@ fn calculate_cigar(
                 maxscore = cur_score;
             }
         }
-        
+
         if *overhang_strategy != SWOverhangStrategy::LeadingIndel {
             for j in 1..=alt_length {
                 let cur_score = sw[ref_length][j];
-                if cur_score > maxscore || (cur_score == maxscore && (ref_length as i32 - j as i32).abs() < (p1 as i32 - p2 as i32).abs()) {
+                if cur_score > maxscore
+                    || (cur_score == maxscore
+                        && (ref_length as i32 - j as i32).abs() < (p1 as i32 - p2 as i32).abs())
+                {
                     p1 = ref_length;
                     p2 = j;
                     maxscore = cur_score;
@@ -214,12 +237,12 @@ fn calculate_cigar(
     }
 
     let mut state = State::Match;
-    
+
     while p1 > 0 && p2 > 0 {
         let btr = btrack[p1][p2];
         let new_state;
         let mut step_length = 1;
-        
+
         if btr > 0 {
             new_state = State::Deletion;
             step_length = btr as usize;
@@ -231,9 +254,16 @@ fn calculate_cigar(
         }
 
         match new_state {
-            State::Match => { p1 -= 1; p2 -= 1; },
-            State::Insertion => { p2 -= step_length; },
-            State::Deletion => { p1 -= step_length; },
+            State::Match => {
+                p1 -= 1;
+                p2 -= 1;
+            }
+            State::Insertion => {
+                p2 -= step_length;
+            }
+            State::Deletion => {
+                p1 -= step_length;
+            }
             _ => unreachable!(),
         }
 

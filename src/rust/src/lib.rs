@@ -9,12 +9,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub mod pair_hmm;
 pub mod assembly;
-pub mod smith_waterman;
 pub mod haplotype_caller;
 pub mod hc_tools;
 pub mod interval_tools;
+pub mod pair_hmm;
+pub mod smith_waterman;
 pub mod split_n_cigar;
 
 pub fn version() -> &'static str {

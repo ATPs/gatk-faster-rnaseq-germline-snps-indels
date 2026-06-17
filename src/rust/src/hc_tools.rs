@@ -176,8 +176,8 @@ pub fn read_vcf_records(path: &Path) -> Result<Vec<VcfRecord>> {
             line.clear();
             continue;
         }
-        records.push(
-            parse_vcf_record(line.trim_end())
+        records.extend(
+            parse_vcf_records(line.trim_end())
                 .with_context(|| format!("parsing VCF record from {}", path.display()))?,
         );
         line.clear();
@@ -799,7 +799,7 @@ fn extract_assembly_state(
     Ok(())
 }
 
-fn parse_vcf_record(line: &str) -> Result<VcfRecord> {
+fn parse_vcf_records(line: &str) -> Result<Vec<VcfRecord>> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 8 {
         bail!("VCF record has fewer than 8 columns: {line}");
@@ -812,18 +812,22 @@ fn parse_vcf_record(line: &str) -> Result<VcfRecord> {
     } else {
         String::new()
     };
-    Ok(VcfRecord {
-        key: VcfKey {
-            chrom: fields[0].to_string(),
-            pos,
-            ref_allele: fields[3].to_string(),
-            alt: fields[4].to_string(),
-        },
-        qual: fields[5].to_string(),
-        filter: fields[6].to_string(),
-        info: parse_info(fields[7]),
-        gt,
-    })
+    let info = parse_info(fields[7]);
+    Ok(fields[4]
+        .split(',')
+        .map(|alt| VcfRecord {
+            key: VcfKey {
+                chrom: fields[0].to_string(),
+                pos,
+                ref_allele: fields[3].to_string(),
+                alt: alt.to_string(),
+            },
+            qual: fields[5].to_string(),
+            filter: fields[6].to_string(),
+            info: info.clone(),
+            gt: gt.clone(),
+        })
+        .collect())
 }
 
 fn parse_gt(format: &str, sample: &str) -> String {
@@ -1049,7 +1053,7 @@ fn write_vcf_summary_markdown(path: &Path, comparison: &VcfComparison) -> Result
     writeln!(out)?;
     writeln!(
         out,
-        "| dataset | total | PASS | non-PASS | PASS SNP | PASS indel/complex | all SNP | all indel/complex | filters |"
+        "| dataset | total allele keys | PASS allele keys | non-PASS allele keys | PASS SNP | PASS indel/complex | all SNP | all indel/complex | filters |"
     )?;
     writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---|")?;
     write_summary_count_row(&mut out, &comparison.a_label, &comparison.a_summary)?;
@@ -1065,7 +1069,7 @@ fn write_vcf_summary_markdown(path: &Path, comparison: &VcfComparison) -> Result
         out,
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )?;
-    write_comparison_row(&mut out, "all records", &comparison.all_records)?;
+    write_comparison_row(&mut out, "all allele keys", &comparison.all_records)?;
     write_comparison_row(&mut out, "PASS only", &comparison.pass_records)?;
     Ok(())
 }
@@ -1713,6 +1717,31 @@ mod tests {
             map_get(&comparison.pass_records.a_private_types, "INDEL_OR_COMPLEX"),
             1
         );
+    }
+
+    #[test]
+    fn vcf_compare_splits_multiallelic_alt_keys() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.vcf");
+        let b = dir.path().join("b.vcf");
+        fs::write(
+            &a,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\nchr1\t10\t.\tA\tC,G\t50\tPASS\t.\tGT\t1/2\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\nchr1\t10\t.\tA\tG\t50\tPASS\t.\tGT\t0/1\n",
+        )
+        .unwrap();
+        let comparison = compare_vcfs(&a, &b, "a", "b").unwrap();
+        assert_eq!(comparison.pass_records.a_count, 2);
+        assert_eq!(comparison.pass_records.b_count, 1);
+        assert_eq!(comparison.pass_records.shared, 1);
+        assert_eq!(comparison.pass_records.a_private, 1);
+        assert_eq!(comparison.pass_records.b_private, 0);
+        assert_eq!(map_get(&comparison.pass_records.shared_types, "SNP"), 1);
+        assert_eq!(map_get(&comparison.pass_records.a_private_types, "SNP"), 1);
     }
 
     #[test]

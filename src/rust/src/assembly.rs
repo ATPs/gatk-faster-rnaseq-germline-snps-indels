@@ -84,7 +84,9 @@ impl ReadThreadingGraph {
     pub fn add_edge(&mut self, source: usize, target: usize, is_ref: bool) {
         // Update out-edge from source to target
         let source_out = self.out_edges.get_mut(&source).unwrap();
-        let edge = source_out.entry(target).or_insert_with(|| Edge::new(is_ref, 0));
+        let edge = source_out
+            .entry(target)
+            .or_insert_with(|| Edge::new(is_ref, 0));
         edge.multiplicity += 1;
         if is_ref {
             edge.is_ref = true;
@@ -92,7 +94,9 @@ impl ReadThreadingGraph {
 
         // Update in-edge from target to source
         let target_in = self.in_edges.get_mut(&target).unwrap();
-        let edge = target_in.entry(source).or_insert_with(|| Edge::new(is_ref, 0));
+        let edge = target_in
+            .entry(source)
+            .or_insert_with(|| Edge::new(is_ref, 0));
         edge.multiplicity += 1;
         if is_ref {
             edge.is_ref = true;
@@ -120,7 +124,7 @@ impl ReadThreadingGraph {
         if sequence.len() < self.kmer_size {
             return;
         }
-        
+
         let first_kmer = &sequence[0..self.kmer_size];
         let mut prev_vertex = self.get_or_create_vertex(first_kmer);
 
@@ -128,10 +132,25 @@ impl ReadThreadingGraph {
             prev_vertex = self.extend_chain_by_one(prev_vertex, sequence, start_pos, is_ref);
         }
     }
+
+    pub fn prune(&mut self, min_prune_factor: usize) {
+        let mut edges_to_remove = Vec::new();
+        for (source, out_map) in &self.out_edges {
+            for (target, edge) in out_map {
+                if !edge.is_ref && edge.multiplicity < min_prune_factor {
+                    edges_to_remove.push((*source, *target));
+                }
+            }
+        }
+        for (source, target) in edges_to_remove {
+            self.out_edges.get_mut(&source).unwrap().remove(&target);
+            self.in_edges.get_mut(&target).unwrap().remove(&source);
+        }
+    }
 }
 
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 #[derive(Clone, Debug)]
 pub struct KBestPath {
@@ -162,10 +181,15 @@ impl Ord for KBestPath {
 }
 
 impl ReadThreadingGraph {
-    pub fn find_best_haplotypes(&self, source: usize, sink: usize, max_haplotypes: usize) -> Vec<KBestPath> {
+    pub fn find_best_haplotypes(
+        &self,
+        source: usize,
+        sink: usize,
+        max_haplotypes: usize,
+    ) -> Vec<KBestPath> {
         let mut result = Vec::new();
         let mut queue = BinaryHeap::new();
-        
+
         queue.push(KBestPath {
             edges: Vec::new(),
             score: 0.0,
@@ -199,17 +223,18 @@ impl ReadThreadingGraph {
                     }
 
                     if let Some(out_edges) = self.out_edges.get(&path.last_vertex) {
-                        let total_multiplicity: usize = out_edges.values().map(|e| e.multiplicity).sum();
+                        let total_multiplicity: usize =
+                            out_edges.values().map(|e| e.multiplicity).sum();
                         let total_f64 = total_multiplicity as f64;
 
                         for (&target, edge) in out_edges {
                             if edge.multiplicity == 0 {
                                 continue;
                             }
-                            
+
                             let mut new_edges = path.edges.clone();
                             new_edges.push((path.last_vertex, target));
-                            
+
                             let edge_prob = (edge.multiplicity as f64).log10() - total_f64.log10();
                             let new_score = path.score + edge_prob;
 
@@ -224,22 +249,22 @@ impl ReadThreadingGraph {
                 }
             }
         }
-        
+
         result
     }
-    
+
     pub fn reconstruct_sequence(&self, path: &KBestPath) -> Vec<u8> {
         if path.edges.is_empty() {
             return self.vertices[path.last_vertex].sequence.clone();
         }
-        
+
         let mut seq = self.vertices[path.edges[0].0].sequence.clone();
-        
+
         for &(_, target) in &path.edges {
             let target_seq = &self.vertices[target].sequence;
             seq.push(*target_seq.last().unwrap());
         }
-        
+
         seq
     }
 }
