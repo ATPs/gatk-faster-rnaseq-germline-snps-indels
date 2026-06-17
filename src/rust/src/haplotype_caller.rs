@@ -485,6 +485,7 @@ struct ReplayWorkerOutput {
     active_loci: Vec<ReplayActiveLocusRow>,
     read_observations: Vec<ReplayReadObservationRow>,
     events: Vec<ReplayEventRow>,
+    haplotypes: Vec<ReplayHaplotypeRow>,
 }
 
 impl ReplayWorkerOutput {
@@ -494,6 +495,7 @@ impl ReplayWorkerOutput {
         self.active_loci.extend(other.active_loci);
         self.read_observations.extend(other.read_observations);
         self.events.extend(other.events);
+        self.haplotypes.extend(other.haplotypes);
     }
 }
 
@@ -571,6 +573,20 @@ struct ReplayGenotypeRow {
     qd: f64,
     pl: String,
     db: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayHaplotypeRow {
+    region: String,
+    stage: &'static str,
+    haplotype: usize,
+    span_start: u64,
+    span_end: u64,
+    kmer: u32,
+    length: u32,
+    cigar: String,
+    is_ref: bool,
+    bases: String,
 }
 
 impl From<&VariantCall> for ReplayGenotypeRow {
@@ -996,7 +1012,7 @@ fn scan_replay_window(
             end: region_interval.end,
             region: region.clone(),
             ..ReplayActiveRegionRow::default()
-        };
+        };        let mut region_events = Vec::new();
 
         let mut pileups = bam.pileup();
         pileups.set_max_depth(PIPELINE_MAX_DEPTH);
@@ -1092,7 +1108,7 @@ fn scan_replay_window(
             ) {
                 active_region.candidate_events += 1;
                 output.events.push(replay_event_row(&region, &call)?);
-                output.variants.push(call);
+                region_events.push(call);
             }
             if let Some(call) = best_indel_call(
                 &region_interval.contig,
@@ -1104,9 +1120,39 @@ fn scan_replay_window(
             ) {
                 active_region.candidate_events += 1;
                 output.events.push(replay_event_row(&region, &call)?);
-                output.variants.push(call);
+                region_events.push(call);
             }
         }
+
+        let ref_region_start_offset = (region_interval.start - window.start) as usize;
+        let ref_region_end_offset = (region_interval.end - window.start) as usize;
+        let local_ref_bases = &ref_bases[ref_region_start_offset..=ref_region_end_offset];
+        
+        let local_haplotypes = build_local_haplotypes(
+            &region_interval.contig,
+            region_interval.start,
+            region_interval.end,
+            local_ref_bases,
+            &region_events,
+            128,
+        );
+
+        for (i, hap) in local_haplotypes.into_iter().enumerate() {
+            output.haplotypes.push(ReplayHaplotypeRow {
+                region: region.clone(),
+                stage: "unclipped",
+                haplotype: i,
+                span_start: region_interval.start,
+                span_end: region_interval.end,
+                kmer: 0,
+                length: hap.bases.len() as u32,
+                cigar: hap.cigar,
+                is_ref: hap.is_ref,
+                bases: String::from_utf8_lossy(&hap.bases).into_owned(),
+            });
+        }
+
+        output.variants.extend(region_events);
         if active_region.observed_loci > 0 {
             active_region.mean_alt_fraction /= active_region.observed_loci as f64;
         }
@@ -2349,6 +2395,12 @@ fn sort_replay_rows(output: &mut ReplayWorkerOutput, dict: &SequenceDict) -> Res
             .then(a.event_type.cmp(&b.event_type))
             .then(a.alleles.cmp(&b.alleles))
     });
+    output.haplotypes.sort_by(|a, b| {
+        a.region
+            .cmp(&b.region)
+            .then(a.stage.cmp(&b.stage))
+            .then(a.haplotype.cmp(&b.haplotype))
+    });
     Ok(())
 }
 
@@ -2368,7 +2420,8 @@ fn write_replay_tables(
         &replay_prefixed_path(prefix, "genotypes.tsv"),
         genotype_rows,
     )?;
-    write_empty_replay_haplotype_tables(prefix)?;
+    write_replay_haplotypes(&replay_prefixed_path(prefix, "haplotypes.tsv"), output)?;
+    write_empty_pairhmm_and_allele_likelihoods(prefix)?;
     Ok(())
 }
 
@@ -2512,17 +2565,160 @@ fn write_replay_genotypes(path: &Path, rows: &[ReplayGenotypeRow]) -> Result<()>
     }
     Ok(())
 }
-
-fn write_empty_replay_haplotype_tables(prefix: &Path) -> Result<()> {
-    let mut haplotypes = BufWriter::new(File::create(replay_prefixed_path(
-        prefix,
-        "genotyper_haplotypes.tsv",
-    ))?);
+fn write_replay_haplotypes(path: &Path, output: &ReplayWorkerOutput) -> Result<()> {
+    create_parent_dir(path)?;
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
     writeln!(
-        haplotypes,
+        writer,
         "region\tstage\thaplotype\tspan_start\tspan_end\tkmer\tlength\tcigar\tis_ref\tbases"
     )?;
+    for row in &output.haplotypes {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.region,
+            row.stage,
+            row.haplotype,
+            row.span_start,
+            row.span_end,
+            row.kmer,
+            row.length,
+            row.cigar,
+            row.is_ref,
+            row.bases
+        )?;
+    }
+    Ok(())
+}
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct LocalHaplotype {
+    bases: Vec<u8>,
+    is_ref: bool,
+    cigar: String,
+}
+
+fn push_cigar(cigar: &mut Vec<(u32, char)>, len: u32, op: char) {
+    if len == 0 {
+        return;
+    }
+    if let Some(last) = cigar.last_mut() {
+        if last.1 == op {
+            last.0 += len;
+            return;
+        }
+    }
+    cigar.push((len, op));
+}
+
+fn format_cigar(cigar: &[(u32, char)]) -> String {
+    let mut s = String::with_capacity(cigar.len() * 4);
+    for &(len, op) in cigar {
+        s.push_str(&len.to_string());
+        s.push(op);
+    }
+    s
+}
+
+fn build_local_haplotypes(
+    _contig: &str,
+    region_start: u64,
+    region_end: u64,
+    ref_bases: &[u8],
+    candidate_events: &[VariantCall],
+    max_haplotypes: usize,
+) -> Vec<LocalHaplotype> {
+    let ref_hap = LocalHaplotype {
+        bases: ref_bases.to_vec(),
+        is_ref: true,
+        cigar: format!("{}M", ref_bases.len()),
+    };
+
+    let mut haplotypes = vec![ref_hap];
+
+    let mut valid_events = Vec::new();
+    for event in candidate_events {
+        let event_end = event.pos + event.ref_allele.len() as u64 - 1;
+        if event.pos >= region_start && event_end <= region_end {
+            valid_events.push(event);
+        }
+    }
+
+    if valid_events.len() > 7 {
+        valid_events.truncate(7);
+    }
+
+    let n_events = valid_events.len();
+    for mask in 1..(1 << n_events) {
+        if haplotypes.len() >= max_haplotypes {
+            break;
+        }
+
+        let mut overlap = false;
+        let mut last_end = 0;
+        let mut selected_events = Vec::new();
+        for i in 0..n_events {
+            if (mask & (1 << i)) != 0 {
+                let ev = valid_events[i];
+                if ev.pos <= last_end {
+                    overlap = true;
+                    break;
+                }
+                last_end = ev.pos + ev.ref_allele.len() as u64 - 1;
+                selected_events.push(ev);
+            }
+        }
+
+        if overlap {
+            continue;
+        }
+
+        let mut bases = Vec::with_capacity(ref_bases.len());
+        let mut cigar_ops = Vec::new();
+        let mut ref_offset = 0;
+        let mut current_pos = region_start;
+
+        for ev in &selected_events {
+            let dist = ev.pos.saturating_sub(current_pos) as usize;
+            if dist > 0 {
+                bases.extend_from_slice(&ref_bases[ref_offset..ref_offset + dist]);
+                push_cigar(&mut cigar_ops, dist as u32, 'M');
+                ref_offset += dist;
+                current_pos += dist as u64;
+            }
+
+            bases.extend_from_slice(&ev.alt_allele);
+            let match_len = (ev.alt_allele.len() as u32).min(ev.ref_allele.len() as u32);
+            push_cigar(&mut cigar_ops, match_len, 'M');
+            
+            if ev.alt_allele.len() > ev.ref_allele.len() {
+                push_cigar(&mut cigar_ops, (ev.alt_allele.len() - ev.ref_allele.len()) as u32, 'I');
+            } else if ev.ref_allele.len() > ev.alt_allele.len() {
+                push_cigar(&mut cigar_ops, (ev.ref_allele.len() - ev.alt_allele.len()) as u32, 'D');
+            }
+
+            ref_offset += ev.ref_allele.len();
+            current_pos += ev.ref_allele.len() as u64;
+        }
+
+        let rem = ref_bases.len().saturating_sub(ref_offset);
+        if rem > 0 {
+            bases.extend_from_slice(&ref_bases[ref_offset..]);
+            push_cigar(&mut cigar_ops, rem as u32, 'M');
+        }
+
+        haplotypes.push(LocalHaplotype {
+            bases,
+            is_ref: false,
+            cigar: format_cigar(&cigar_ops),
+        });
+    }
+
+    haplotypes
+}
+
+fn write_empty_pairhmm_and_allele_likelihoods(prefix: &Path) -> Result<()> {
     let mut pairhmm = BufWriter::new(File::create(replay_prefixed_path(prefix, "pairhmm.tsv"))?);
     writeln!(
         pairhmm,
