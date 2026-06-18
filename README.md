@@ -37,9 +37,9 @@ Core external tools used by this project:
 - samtools
 - sambamba
 - Python 3
-- Rust and Cargo
+- Rust and Cargo, if you want to build the Rust binaries locally
 
-See `build.md` for the portable build flow and Rust binary installation steps.
+You may either download prebuilt Rust binaries from the GitHub release assets or build them locally. See `build.md` for the portable local build flow.
 
 ## Important Note About Defaults
 
@@ -54,9 +54,19 @@ On another machine, pass your own paths explicitly.
 
 ## Quick Start
 
-### 1. Build and install the Rust binaries
+### 1. Install the Rust binaries
 
-Follow `build.md`.
+You have two options:
+
+- Download the Linux x86_64 release asset `rust_binary.linux.amd64.tar.gz` from GitHub Releases and extract it at the repository root:
+
+```bash
+tar -xzf rust_binary.linux.amd64.tar.gz
+```
+
+This creates `rust_binary/`, which the Python pipeline uses automatically.
+
+- Or build the Rust binaries locally by following `build.md`.
 
 ### 2. Run the full pipeline from FASTQ
 

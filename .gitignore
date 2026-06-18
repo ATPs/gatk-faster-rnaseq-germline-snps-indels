@@ -37,3 +37,6 @@ Thumbs.db
 
 src/rust/bin/
 rust_binary/
+
+*.tar.gz
+*.tar.gz*
