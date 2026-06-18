@@ -3,11 +3,12 @@
 This repository keeps all Rust code for the RNA-seq pipeline in a single crate:
 
 - crate root: `src/rust`
-- shared Rust modules: `src/rust/src`
-- binary entrypoints: `src/rust/src/bin`
+- shared Rust modules and submodules: `src/rust/src`
+- Rust CLI entrypoints only: `src/rust/cli`
 - installed release binaries: `src/rust/bin`
 
 The Python pipeline looks for the installed binaries in `src/rust/bin` by default.
+The preferred Python entrypoint is repo root `gatk-faster-rnaseq-germline-snps-indels.py`.
 
 ## Binaries
 
@@ -41,6 +42,7 @@ Use the same shell environment as normal local runs:
 source /data/p/anaconda3/etc/profile.d/conda.sh
 conda activate base
 export PATH=/data/p/bin:$PATH
+export PYTHONPATH=/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src${PYTHONPATH:+:$PYTHONPATH}
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 ```
 
@@ -204,17 +206,18 @@ Check wrapper and pipeline syntax:
 source /data/p/anaconda3/etc/profile.d/conda.sh
 conda activate base
 export PATH=/data/p/bin:$PATH
+export PYTHONPATH=/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src${PYTHONPATH:+:$PYTHONPATH}
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
-python -m py_compile src/*.py
-python src/run_pipeline.py --help
-python src/step_bed_to_interval_list.py --help
-python src/step_split_n_cigar.py --help
-python src/step_base_recalibrator.py --help
-python src/step_apply_bqsr.py --help
-python src/step_mark_duplicates.py --help
-python src/step_split_hc_intervals.py --help
-python src/step_hc_prefilter.py --help
-python src/step_haplotype_caller.py --help
+python -m py_compile gatk-faster-rnaseq-germline-snps-indels.py src/gatk_faster_rnaseq/**/*.py
+python gatk-faster-rnaseq-germline-snps-indels.py --help
+python -m gatk_faster_rnaseq.steps.bed_to_interval_list --help
+python -m gatk_faster_rnaseq.steps.split_n_cigar --help
+python -m gatk_faster_rnaseq.steps.base_recalibrator --help
+python -m gatk_faster_rnaseq.steps.apply_bqsr --help
+python -m gatk_faster_rnaseq.steps.mark_duplicates --help
+python -m gatk_faster_rnaseq.steps.split_hc_intervals --help
+python -m gatk_faster_rnaseq.steps.hc_prefilter --help
+python -m gatk_faster_rnaseq.steps.haplotype_caller --help
 ```
 
 ## HaplotypeCaller matching tools
@@ -319,9 +322,10 @@ Rust command timed for the HaplotypeCaller replacement stage only:
 source /data/p/anaconda3/etc/profile.d/conda.sh
 conda activate base
 export PATH=/data/p/bin:$PATH
+export PYTHONPATH=/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src${PYTHONPATH:+:$PYTHONPATH}
 cd /data/p/gatk/gatk-faster-rnaseq-germline-snps-indels
 /usr/bin/time -v \
-  python src/step_haplotype_caller.py \
+  python -m gatk_faster_rnaseq.steps.haplotype_caller \
     --backend rust \
     --rust-bin src/rust/bin/rust_haplotype_caller \
     --ref /data1/pub/gatk/broad_hg38/Homo_sapiens_assembly38.fasta \
@@ -417,9 +421,9 @@ By default, the Python code resolves Rust tools from `src/rust/bin`.
 
 Relevant files:
 
-- [src/step_common.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/step_common.py:32)
-- [src/run_pipeline.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/run_pipeline.py:159)
-- [src/run_pipeline.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/run_pipeline.py:278)
+- [src/gatk_faster_rnaseq/steps/common.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/gatk_faster_rnaseq/steps/common.py)
+- [src/gatk_faster_rnaseq/pipeline/runner.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/src/gatk_faster_rnaseq/pipeline/runner.py)
+- [gatk-faster-rnaseq-germline-snps-indels.py](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/gatk-faster-rnaseq-germline-snps-indels.py)
 
 Useful runtime options:
 

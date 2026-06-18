@@ -5,79 +5,79 @@ edition = "2021"
 
 [[bin]]
 name = "rust_apply_bqsr"
-path = "src/bin/rust_apply_bqsr.rs"
+path = "cli/rust_apply_bqsr.rs"
 
 [[bin]]
 name = "rust_hc_prefilter"
-path = "src/bin/rust_hc_prefilter.rs"
+path = "cli/rust_hc_prefilter.rs"
 
 [[bin]]
 name = "rust_haplotype_caller"
-path = "src/bin/rust_haplotype_caller.rs"
+path = "cli/rust_haplotype_caller.rs"
 
 [[bin]]
 name = "rust_base_recalibrator"
-path = "src/bin/rust_base_recalibrator.rs"
+path = "cli/rust_base_recalibrator.rs"
 
 [[bin]]
 name = "rust_mark_duplicates"
-path = "src/bin/rust_mark_duplicates.rs"
+path = "cli/rust_mark_duplicates.rs"
 
 [[bin]]
 name = "rust_split_n_cigar_reads"
-path = "src/bin/rust_split_n_cigar_reads.rs"
+path = "cli/rust_split_n_cigar_reads.rs"
 
 [[bin]]
 name = "rust_interval_tools"
-path = "src/bin/rust_interval_tools.rs"
+path = "cli/rust_interval_tools.rs"
 
 [[bin]]
 name = "rust_hc_vcf_compare"
-path = "src/bin/rust_hc_vcf_compare.rs"
+path = "cli/rust_hc_vcf_compare.rs"
 
 [[bin]]
 name = "rust_hc_select_regions"
-path = "src/bin/rust_hc_select_regions.rs"
+path = "cli/rust_hc_select_regions.rs"
 
 [[bin]]
 name = "rust_hc_run_gatk_oracle"
-path = "src/bin/rust_hc_run_gatk_oracle.rs"
+path = "cli/rust_hc_run_gatk_oracle.rs"
 
 [[bin]]
 name = "rust_hc_gatk_debug_extract"
-path = "src/bin/rust_hc_gatk_debug_extract.rs"
+path = "cli/rust_hc_gatk_debug_extract.rs"
 
 [[bin]]
 name = "rust_hc_region_replay"
-path = "src/bin/rust_hc_region_replay.rs"
+path = "cli/rust_hc_region_replay.rs"
 
 [[bin]]
 name = "rust_hc_vcf_to_genotype_table"
-path = "src/bin/rust_hc_vcf_to_genotype_table.rs"
+path = "cli/rust_hc_vcf_to_genotype_table.rs"
 
 [[bin]]
 name = "rust_hc_active_region_diff"
-path = "src/bin/rust_hc_active_region_diff.rs"
+path = "cli/rust_hc_active_region_diff.rs"
 
 [[bin]]
 name = "rust_hc_read_finalize_diff"
-path = "src/bin/rust_hc_read_finalize_diff.rs"
+path = "cli/rust_hc_read_finalize_diff.rs"
 
 [[bin]]
 name = "rust_hc_assembly_diff"
-path = "src/bin/rust_hc_assembly_diff.rs"
+path = "cli/rust_hc_assembly_diff.rs"
 
 [[bin]]
 name = "rust_hc_pairhmm_diff"
-path = "src/bin/rust_hc_pairhmm_diff.rs"
+path = "cli/rust_hc_pairhmm_diff.rs"
 
 [[bin]]
 name = "rust_hc_genotype_diff"
-path = "src/bin/rust_hc_genotype_diff.rs"
+path = "cli/rust_hc_genotype_diff.rs"
 
 [[bin]]
 name = "rust_hc_acceptance_report"
-path = "src/bin/rust_hc_acceptance_report.rs"
+path = "cli/rust_hc_acceptance_report.rs"
 
 [dependencies]
 anyhow = "1.0"
