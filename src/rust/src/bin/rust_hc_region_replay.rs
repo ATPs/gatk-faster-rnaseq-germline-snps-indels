@@ -28,6 +28,9 @@ struct Args {
     dbsnp: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
+    exclude_supplementary: bool,
+
+    #[arg(long, default_value_t = false)]
     dont_use_soft_clipped_bases: bool,
 
     #[arg(long, default_value_t = 20.0)]
@@ -70,6 +73,7 @@ fn main() -> Result<()> {
             input_interval_list: args.input_interval_list,
             output_vcf: PathBuf::from("/dev/null"),
             dbsnp: args.dbsnp,
+            exclude_supplementary: args.exclude_supplementary,
             dont_use_soft_clipped_bases: args.dont_use_soft_clipped_bases,
             standard_min_confidence_threshold_for_calling: args
                 .standard_min_confidence_threshold_for_calling,

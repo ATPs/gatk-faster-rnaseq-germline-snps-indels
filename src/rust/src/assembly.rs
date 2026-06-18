@@ -162,7 +162,10 @@ pub struct KBestPath {
 
 impl PartialEq for KBestPath {
     fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
+        self.score.to_bits() == other.score.to_bits()
+            && self.is_reference == other.is_reference
+            && self.last_vertex == other.last_vertex
+            && self.edges == other.edges
     }
 }
 
@@ -170,13 +173,18 @@ impl Eq for KBestPath {}
 
 impl PartialOrd for KBestPath {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.score.partial_cmp(&other.score)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for KBestPath {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.is_reference.cmp(&other.is_reference))
+            .then_with(|| other.edges.len().cmp(&self.edges.len()))
+            .then_with(|| other.edges.cmp(&self.edges))
+            .then_with(|| other.last_vertex.cmp(&self.last_vertex))
     }
 }
 
@@ -227,7 +235,19 @@ impl ReadThreadingGraph {
                             out_edges.values().map(|e| e.multiplicity).sum();
                         let total_f64 = total_multiplicity as f64;
 
-                        for (&target, edge) in out_edges {
+                        let mut sorted_edges: Vec<(usize, &Edge)> = out_edges
+                            .iter()
+                            .map(|(&target, edge)| (target, edge))
+                            .collect();
+                        sorted_edges.sort_by(|(target_a, edge_a), (target_b, edge_b)| {
+                            edge_b
+                                .multiplicity
+                                .cmp(&edge_a.multiplicity)
+                                .then_with(|| edge_b.is_ref.cmp(&edge_a.is_ref))
+                                .then_with(|| target_a.cmp(target_b))
+                        });
+
+                        for (target, edge) in sorted_edges {
                             if edge.multiplicity == 0 {
                                 continue;
                             }
@@ -266,5 +286,42 @@ impl ReadThreadingGraph {
         }
 
         seq
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn kbest_path_order_prefers_shorter_then_lexicographically_smaller_equal_score_paths() {
+        let shorter = KBestPath {
+            edges: vec![(0, 2)],
+            score: -1.0,
+            is_reference: false,
+            last_vertex: 2,
+        };
+        let longer = KBestPath {
+            edges: vec![(0, 1), (1, 2)],
+            score: -1.0,
+            is_reference: false,
+            last_vertex: 2,
+        };
+        let lexicographically_larger = KBestPath {
+            edges: vec![(0, 3)],
+            score: -1.0,
+            is_reference: false,
+            last_vertex: 3,
+        };
+
+        let mut heap = BinaryHeap::new();
+        heap.push(lexicographically_larger);
+        heap.push(longer);
+        heap.push(shorter.clone());
+
+        assert_eq!(heap.pop().unwrap().edges, shorter.edges);
+        assert_eq!(heap.pop().unwrap().edges, vec![(0, 3)]);
+        assert_eq!(heap.pop().unwrap().edges, vec![(0, 1), (1, 2)]);
     }
 }

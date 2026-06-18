@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--pair-hmm-implementation", choices=("rust", "native"), default="native")
     parser.add_argument("--java-mem", default="24g")
     parser.add_argument("--dbsnp", type=existing, default=DEFAULT_DBSNP)
+    parser.add_argument("--exclude-supplementary", action="store_true")
     args = parser.parse_args()
 
     args.output_vcf.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +80,8 @@ def main() -> int:
             "--pair-hmm-implementation",
             args.pair_hmm_implementation,
         ]
+        if args.exclude_supplementary:
+            command.append("--exclude-supplementary")
         if args.dbsnp is not None:
             command.extend(["--dbsnp", str(args.dbsnp)])
     run_command(command)
