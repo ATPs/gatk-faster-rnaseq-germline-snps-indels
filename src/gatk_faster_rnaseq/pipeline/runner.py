@@ -26,7 +26,8 @@ from ..steps.common import (
 
 
 REPO_SRC_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_RUST_BIN_DIR = REPO_SRC_DIR / "rust" / "bin"
+REPO_ROOT_DIR = REPO_SRC_DIR.parent
+DEFAULT_RUST_BINARY_DIR = REPO_ROOT_DIR / "rust_binary"
 PYTHON_STEP_MODULE_PREFIX = "gatk_faster_rnaseq.steps"
 
 
@@ -76,7 +77,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rust-bin-dir",
         type=Path,
-        default=DEFAULT_RUST_BIN_DIR,
+        default=DEFAULT_RUST_BINARY_DIR,
         help="Directory containing release Rust pipeline binaries.",
     )
     parser.add_argument(

@@ -13,6 +13,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_SRC_DIR = SCRIPT_DIR.parents[1]
+REPO_ROOT_DIR = REPO_SRC_DIR.parent
 DEFAULT_FASTQ_DIR = Path("/data1/xlab/researches/AML/Leucegene/raw/PRJNA214592/SRR949115")
 DEFAULT_GATK_RESOURCES = Path("/data1/pub/gatk/broad_hg38")
 DEFAULT_REF = DEFAULT_GATK_RESOURCES / "Homo_sapiens_assembly38.fasta"
@@ -30,14 +31,14 @@ GATK = Path("/data/p/gatk/gatk-4.6.2.0/gatk")
 STAR = Path("/data/p/star/STAR_2.7.11b/Linux_x86_64_static/STAR")
 SAMTOOLS = Path("/data/p/samtools/samtools-1.22.1_installed/bin/samtools")
 SAMBAMBA = Path("/data/p/tools/sambamba/bin/sambamba-1.0.1")
-RUST_BIN_DIR = REPO_SRC_DIR / "rust" / "bin"
-RUST_INTERVAL_TOOLS = RUST_BIN_DIR / "rust_interval_tools"
-RUST_SPLIT_N_CIGAR_READS = RUST_BIN_DIR / "rust_split_n_cigar_reads"
-RUST_APPLY_BQSR = RUST_BIN_DIR / "rust_apply_bqsr"
-RUST_BASE_RECALIBRATOR = RUST_BIN_DIR / "rust_base_recalibrator"
-RUST_MARK_DUPLICATES = RUST_BIN_DIR / "rust_mark_duplicates"
-RUST_HC_PREFILTER = RUST_BIN_DIR / "rust_hc_prefilter"
-RUST_HAPLOTYPE_CALLER = RUST_BIN_DIR / "rust_haplotype_caller"
+RUST_BINARY_DIR = REPO_ROOT_DIR / "rust_binary"
+RUST_INTERVAL_TOOLS = RUST_BINARY_DIR / "rust_interval_tools"
+RUST_SPLIT_N_CIGAR_READS = RUST_BINARY_DIR / "rust_split_n_cigar_reads"
+RUST_APPLY_BQSR = RUST_BINARY_DIR / "rust_apply_bqsr"
+RUST_BASE_RECALIBRATOR = RUST_BINARY_DIR / "rust_base_recalibrator"
+RUST_MARK_DUPLICATES = RUST_BINARY_DIR / "rust_mark_duplicates"
+RUST_HC_PREFILTER = RUST_BINARY_DIR / "rust_hc_prefilter"
+RUST_HAPLOTYPE_CALLER = RUST_BINARY_DIR / "rust_haplotype_caller"
 
 
 def quote_cmd(command: list[str]) -> str:

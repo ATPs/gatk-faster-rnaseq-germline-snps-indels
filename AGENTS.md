@@ -24,6 +24,7 @@ the source code of gatk is in folder `/data/p/gatk/gatk`. we may need to underst
 - python package code should live under `src/gatk_faster_rnaseq/`. the preferred main entrypoint is repo root `gatk-faster-rnaseq-germline-snps-indels.py`.
 - do not add top-level pipeline wrapper files back under `src/` such as `src/run_pipeline.py`, `src/step_*.py`, or `src/step_common.py`. use the package modules directly.
 - rust implementation code should live in `src/rust/src` library modules. rust executable entrypoints should live in `src/rust/cli/*.rs` and stay thin.
+- installed release rust executables used by the python pipeline should live in repo-root `rust_binary/`.
 - keep new python and rust source files below 1000 lines when practical. if a file is approaching that size, split it into submodules before adding more logic.
 
 # test the code
