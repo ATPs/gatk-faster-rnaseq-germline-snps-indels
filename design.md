@@ -221,5 +221,3 @@ The current design follows a few deliberate rules:
 
 - `README.md`: user-facing overview and quick start
 - `build.md`: build and installation details
-- `development/background.md`: background and pipeline context
-- `development/*.md`: experiment notes and validation history

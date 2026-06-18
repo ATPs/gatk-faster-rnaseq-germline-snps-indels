@@ -26,7 +26,7 @@ The full Rust HaplotypeCaller is present but still experimental. GATK remains th
 - `rust_binary/`: installed release Rust executables used by the pipeline
 - `build.md`: build guide
 - `design.md`: architecture and tool-by-tool design notes
-- `development/`: background notes, benchmarks, and experiment logs
+- `.local/`: ignored local notes, machine-specific instructions, and private experiment records
 
 ## Requirements
 
@@ -155,8 +155,7 @@ python -m gatk_faster_rnaseq.steps.split_n_cigar --help
 
 - `design.md`: current architecture and every tool in the repository
 - `build.md`: build guide
-- `development/background.md`: background context
-- `development/*.md`: experiment records and validation notes
+- `.local/`: optional local background notes and private experiment records
 
 ## License
 

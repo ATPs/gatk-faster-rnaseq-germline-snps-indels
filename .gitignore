@@ -33,6 +33,7 @@ Thumbs.db
 # Misc
 .env
 *.log
+.local/
 
 src/rust/bin/
 rust_binary/

@@ -2,7 +2,7 @@
 
 This file is the portable build guide for contributors who are not on the original development server.
 
-For the archived server-specific commands and historical benchmark notes, see [development/2026-06-18.server-specific-build.md](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/development/2026-06-18.server-specific-build.md).
+Machine-specific commands and historical benchmark notes should live under `.local/` in a local checkout, not in the tracked repository.
 
 ## Repository layout
 
@@ -131,4 +131,4 @@ python -m gatk_faster_rnaseq.steps.apply_bqsr --help
 
 Static builds, custom linker flags, and server-specific environment exports depend on the target machine and libc/toolchain setup. Those commands are intentionally not the default guide here.
 
-If you need the original server-specific static build flow, use [development/2026-06-18.server-specific-build.md](/data/p/gatk/gatk-faster-rnaseq-germline-snps-indels/development/2026-06-18.server-specific-build.md) as a reference and adapt it to your environment.
+
