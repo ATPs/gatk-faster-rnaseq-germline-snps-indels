@@ -150,6 +150,34 @@ A run creates a labeled subdirectory under `--outdir` containing:
 
 The final output is normally `SAMPLE.filtered.vcf.gz`. If `--skip-variant-filtration` is used, the raw VCF is left as the final output.
 
+## SRR949115 Callset Comparison
+
+A local SRR949115 comparison against a DeepVariant callset was run on primary chromosomes (`chr1-22`, `chrX`, `chrY`) using exact split-allele keys (`CHROM POS REF ALT`).
+
+Two sets were compared:
+
+- PASS set: `FILTER == PASS`
+- good set: `FILTER == PASS && FORMAT/DP[0] >= 10 && FORMAT/AD[0:1] >= 3`
+
+PASS-set exact-allele results:
+
+| Pair | Shared | A only | B only |
+|---|---:|---:|---:|
+| GATK Java vs GATK Rust round30 | 28779 | 7703 | 3363 |
+| GATK Java vs DeepVariant | 26834 | 9648 | 45453 |
+| GATK Rust round30 vs DeepVariant | 23705 | 8437 | 48582 |
+
+Good-set exact-allele results:
+
+| Pair | Shared | A only | B only |
+|---|---:|---:|---:|
+| GATK Java vs GATK Rust round30 | 11858 | 455 | 981 |
+| GATK Java vs DeepVariant | 10324 | 1989 | 4356 |
+| GATK Rust round30 vs DeepVariant | 10447 | 2392 | 4233 |
+
+The main conclusion is that the current Rust HaplotypeCaller remains much closer to GATK Java than either GATK callset is to DeepVariant under this RNA-seq comparison. DeepVariant has many more PASS calls before the good-set filter and still has a large DeepVariant-only good-set component after filtering. DeepVariant is treated here as a third callset, not as a truth set.
+
+
 ## Running Individual Steps
 
 Each major step is also callable directly, for example:
